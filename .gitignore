@@ -1,0 +1,33 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.DS_Store
+.env
+.venv/
+venv/
+build/
+dist/
+*.spec
+*.sqlite
+*.db
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.m4a
+*.aac
+
+# app runtime folder (optional to ignore)
+# remove this line if you want to version control settings
+.p2p_community_app/
