@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -11,21 +12,32 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QTextEdit, QListWidget, QListWidgetItem,
     QFileDialog, QMessageBox, QSplitter, QTabWidget, QGroupBox, QFormLayout,
-    QSpinBox, QDoubleSpinBox, QFrame, QSizePolicy
+    QSpinBox, QDoubleSpinBox, QFrame, QSizePolicy, QComboBox,
+    QTextBrowser,   # <-- add this
 )
 from PyQt5.QtGui import QDesktopServices
 
 from blocks import BLOCKS
-from state import STATE, load_account
+from state import (
+    STATE,
+    load_account,
+    ensure_default_lighthouses,
+    register_lighthouse,
+    list_lighthouses,
+)
 from utils import human_bytes, sha256_file
-
+try:
+    from lighthouse_server import LighthouseServer  # type: ignore
+except Exception:
+    LighthouseServer = None
 # Optional: download peer avatars if your p2p.py exposes tcp_request_blob()
 try:
     from p2p import tcp_request_blob  # type: ignore
 except Exception:
     tcp_request_blob = None
-
-
+import html
+def h(s: Any) -> str:
+    return html.escape(str(s or ""), quote=True)
 # ---------------- helpers ----------------
 def run_block(name: str, payload: Any = "", params: Optional[Dict[str, Any]] = None) -> Any:
     blk = BLOCKS.create(name)
@@ -44,7 +56,16 @@ def safe_text(s: Any, max_len: int = 2000) -> str:
         s2 = s2[:max_len] + "…"
     return s2
 
-
+def safe_filename(name: Any, max_len: int = 180) -> str:
+    # Avoid path traversal & weird nul bytes from remote peers.
+    n = os.path.basename(str(name or "file")).replace("\x00", "")
+    if not n:
+        n = "file"
+    if len(n) > max_len:
+        root, ext = os.path.splitext(n)
+        keep = max(1, max_len - len(ext))
+        n = root[:keep] + ext
+    return n or "file"
 def cache_dir() -> Path:
     p = Path.home() / ".p2p_community" / "cache"
     p.mkdir(parents=True, exist_ok=True)
@@ -72,11 +93,38 @@ def sniff_image_ext(path: str) -> str:
     except Exception:
         pass
     return ".bin"
+def gui_cfg_path() -> Path:
+    p = Path.home() / ".p2p_community" / "gui.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
 
+def load_gui_cfg() -> Dict[str, Any]:
+    try:
+        p = gui_cfg_path()
+        if p.exists():
+            return json.loads(p.read_text("utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def save_gui_cfg(cfg: Dict[str, Any]) -> None:
+    try:
+        gui_cfg_path().write_text(json.dumps(cfg, indent=2), "utf-8")
+    except Exception:
+        pass
+
+def parse_lh_list(s: str) -> List[str]:
+    out: List[str] = []
+    for part in (s or "").split(","):
+        t = part.strip()
+        if t:
+            out.append(t)
+    return out
 
 APP_STYLESHEET = """
 QMainWindow { background: #0f1115; }
 QWidget { color: #e7e7e7; font-size: 12px; }
+
 QGroupBox {
   border: 1px solid #2b2f3a;
   border-radius: 10px;
@@ -91,13 +139,59 @@ QGroupBox::title {
   color: #cfd6ff;
   font-weight: 600;
 }
-QLineEdit, QTextEdit, QListWidget {
+
+QLabel[muted="true"] { color: #a8b0c2; }
+
+QFrame#Divider {
+  background: #2b2f3a;
+  min-height: 1px;
+  max-height: 1px;
+}
+
+/* ---------- INPUTS: force readable text on dark bg ---------- */
+QLineEdit, QTextEdit, QPlainTextEdit, QListWidget,
+QSpinBox, QDoubleSpinBox, QAbstractSpinBox {
   background: #0f1320;
+  color: #e7e7e7;                 /* <-- important */
   border: 1px solid #2b2f3a;
   border-radius: 8px;
   padding: 8px;
   selection-background-color: #2c4bff;
+  selection-color: #ffffff;
 }
+
+/* Spinboxes contain a line edit internally */
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {
+  background: #22283a;
+  border: 0px;
+  width: 16px;
+}
+QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover {
+  background: #2a3147;
+}
+
+/* Placeholder readability (Qt 5 supports ::placeholder for QLineEdit) */
+QLineEdit::placeholder {
+  color: #9aa3b7;
+}
+
+/* Make logs readable when using QTextEdit.append("<b>..</b>") */
+QTextEdit, QPlainTextEdit {
+  font-family: Consolas, "Cascadia Mono", Menlo, monospace;
+  font-size: 12px;
+}
+
+/* Lists: make items readable and selections clear */
+QListWidget::item {
+  padding: 6px;
+  color: #e7e7e7;
+}
+QListWidget::item:selected {
+  background: #2c4bff;
+  color: #ffffff;
+}
+
+/* ---------- BUTTONS ---------- */
 QPushButton {
   background: #2c4bff;
   border: 0px;
@@ -107,17 +201,44 @@ QPushButton {
 }
 QPushButton:hover { background: #3656ff; }
 QPushButton:pressed { background: #1e36c9; }
+
 QPushButton[secondary="true"] {
   background: #22283a;
 }
 QPushButton[secondary="true"]:hover {
   background: #2a3147;
 }
-QLabel[muted="true"] { color: #a8b0c2; }
-QFrame#Divider {
-  background: #2b2f3a;
-  min-height: 1px;
-  max-height: 1px;
+/* ---------- TABS (top) ---------- */
+QTabWidget::pane {
+  border: 1px solid #2b2f3a;
+  border-radius: 10px;
+  top: -1px;
+  background: #151924;
+}
+
+QTabBar::tab {
+  background: #0f1320;
+  color: #cfd6ff;          /* readable text */
+  border: 1px solid #2b2f3a;
+  padding: 8px 14px;
+  margin-right: 6px;
+  border-top-left-radius: 10px;
+  border-top-right-radius: 10px;
+}
+
+QTabBar::tab:hover {
+  background: #1a2030;
+}
+
+QTabBar::tab:selected {
+  background: #2c4bff;     /* active tab */
+  color: #ffffff;
+  border-color: #2c4bff;
+}
+
+QTabBar::tab:disabled {
+  color: #7e879a;
+  background: #0b0e16;
 }
 """
 
@@ -134,17 +255,95 @@ class MainWindow(QMainWindow):
         self._dm_offers: List[Dict[str, Any]] = []
         self._peers: List[Dict[str, Any]] = []
         self._selected_peer: Optional[Dict[str, Any]] = None
-
+        self._offer_index: Dict[str, Dict[str, Any]] = {}
         self._last_tx_json: Optional[dict] = None
 
         # Ensure account/p2p ready
         run_block("account", "", {"action": "ensure"})
         run_block("rooms", "", {"action": "join", "room": "general"})
-
+        # Seed persistent lighthouse registry (static default seed)
+        try:
+            ensure_default_lighthouses()
+        except Exception:
+            pass
         me = load_account()
+        # --- PATCH: load lighthouse settings (auto-join) + optional host server ---
+        self._lh_server = None
+        cfg_ui = load_gui_cfg()
+
+        # default from env if user never set UI
+        default_addrs = (
+                cfg_ui.get("lighthouses")
+                or os.environ.get("P2P_LIGHTHOUSES")
+                or os.environ.get("P2P_LIGHTHOUSE")
+                or ""
+        )
+        default_token = cfg_ui.get("lh_token") or os.environ.get("P2P_LIGHTHOUSE_TOKEN") or ""
+        host_on = bool(cfg_ui.get("host_lighthouse", False))
+        host_port = int(cfg_ui.get("host_port", 38888))
+
+        # prefill UI fields if already created later
+        self._lh_boot_addrs = str(default_addrs or "")
+        self._lh_boot_token = str(default_token or "")
+        self._lh_boot_host_on = host_on
+        self._lh_boot_host_port = host_port
         self._my_user_id = str(me.get("user_id", "") or "")
         self._my_name = str(me.get("name", "anon") or "anon")
+        # --- PATCH: ensure P2P is started + identity is set (so presence has tcp_port) ---
+        try:
+            # Start TCP/UDP listeners (TCP binds an actual port, required for presence)
+            STATE.p2p.start()
 
+            # Make sure identity is applied to the running service
+            avatar_path = str(me.get("avatar_path", "") or "")
+
+            # account.json does NOT store wallet_addr; derive from wallet state
+            wallet_addr = ""
+            try:
+                wallet_addr = run_block("wallet", "", {"action": "address"}).get("address", "")
+            except Exception:
+                wallet_addr = str(getattr(STATE.wallet, "address", "") or "")
+
+            STATE.p2p.set_identity(
+                user_id=self._my_user_id,
+                name=self._my_name,
+                avatar_path=avatar_path,
+                wallet_addr=wallet_addr,
+            )
+            STATE.p2p.set_identity(
+                user_id=self._my_user_id,
+                name=self._my_name,
+                avatar_path=avatar_path,
+                wallet_addr=wallet_addr,
+            )
+
+            # Match current room
+            STATE.p2p.set_room("general")
+            try:
+                if self._lh_boot_host_on:
+                    self._start_lighthouse_host(port=self._lh_boot_host_port, quiet=True)
+
+                addrs = parse_lh_list(
+                    self.lh_addr_edit.text() if hasattr(self, "lh_addr_edit") else self._lh_boot_addrs)
+                tok = (self.lh_token_edit.text() if hasattr(self, "lh_token_edit") else self._lh_boot_token).strip()
+
+                # If hosting locally and no connect list, auto-connect to localhost
+                if self._lh_server and not addrs:
+                    addrs = [f"127.0.0.1:{self._lh_boot_host_port}"]
+
+                if addrs and hasattr(STATE.p2p, "connect_lighthouses"):
+                    STATE.p2p.connect_lighthouses(addrs, token=tok)
+
+                try:
+                    STATE.p2p.broadcast_presence()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            # Announce immediately (so peers appear fast)
+            STATE.p2p.broadcast_presence()
+        except Exception:
+            pass
         # Layout root
         root = QWidget()
         self.setCentralWidget(root)
@@ -163,8 +362,14 @@ class MainWindow(QMainWindow):
         side_layout.setSpacing(12)
 
         side_layout.addWidget(self._build_profile_box())
+        try:
+            self.lh_addr_edit.setText(self._lh_boot_addrs)
+            self.lh_token_edit.setText(self._lh_boot_token)
+        except Exception:
+            pass
         side_layout.addWidget(self._build_rooms_box())
         side_layout.addWidget(self._build_peers_box())
+        side_layout.addWidget(self._build_lighthouse_box())
         side_layout.addWidget(self._build_selected_peer_box())
         side_layout.addStretch(1)
 
@@ -196,11 +401,12 @@ class MainWindow(QMainWindow):
 
         self.timer_feed = QTimer(self)
         self.timer_feed.timeout.connect(self._tick_feed)
-        self.timer_feed.start(700)
+        self.timer_feed.start(250)
 
         self._refresh_profile_ui()
         self._refresh_wallet_ui()
         self._tick_peers()
+        self._boot_network()
 
     # ---------------- UI sections ----------------
     def _build_profile_box(self) -> QGroupBox:
@@ -230,7 +436,11 @@ class MainWindow(QMainWindow):
 
         top.addLayout(right, 1)
         lay.addLayout(top)
-
+        # --- PATCH: show P2P status ---
+        self.lbl_p2p_status = QLabel("P2P: ?")
+        self.lbl_p2p_status.setProperty("muted", True)
+        lay.addWidget(self.lbl_p2p_status)
+        # --- /PATCH ---
         self.btn_pick_avatar.clicked.connect(self._pick_avatar)
         self.btn_save_profile.clicked.connect(self._save_profile)
         return box
@@ -331,7 +541,8 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(w)
         lay.setSpacing(12)
 
-        self.room_log = QTextEdit()
+        self.room_log = QTextBrowser()
+        self.room_log.setOpenExternalLinks(False)
         self.room_log.setReadOnly(True)
         self.room_log.setPlaceholderText("Room messages will appear here…")
         lay.addWidget(self.room_log, 2)
@@ -376,6 +587,79 @@ class MainWindow(QMainWindow):
         lay.addWidget(send_box)
         return w
 
+    def _build_lighthouse_box(self) -> QGroupBox:
+        box = QGroupBox("Lighthouse (cross-router)")
+        lay = QVBoxLayout(box)
+
+        # --- Known lighthouses dropdown (from lighthouses.json) ---
+        known_lbl = QLabel("Known lighthouses:")
+        known_lbl.setProperty("muted", True)
+        lay.addWidget(known_lbl)
+
+        row_known = QHBoxLayout()
+        self.lh_known = QComboBox()
+        self.lh_known.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.btn_lh_add_known = QPushButton("Add")
+        self.btn_lh_add_known.setProperty("secondary", True)
+
+        row_known.addWidget(self.lh_known, 1)
+        row_known.addWidget(self.btn_lh_add_known)
+        lay.addLayout(row_known)
+
+        # --- Manual connect list ---
+        lay.addWidget(QLabel("Connect list (comma-separated):"))
+        self.lh_addr_edit = QLineEdit()
+        self.lh_addr_edit.setPlaceholderText("host:38888, otherhost:38888")
+        lay.addWidget(self.lh_addr_edit)
+
+        lay.addWidget(QLabel("Token (optional):"))
+        self.lh_token_edit = QLineEdit()
+        self.lh_token_edit.setPlaceholderText("(optional) token")
+        self.lh_token_edit.setEchoMode(QLineEdit.Password)
+        lay.addWidget(self.lh_token_edit)
+
+        # Prefill from boot config captured in __init__
+        try:
+            self.lh_addr_edit.setText(getattr(self, "_lh_boot_addrs", "") or "")
+            self.lh_token_edit.setText(getattr(self, "_lh_boot_token", "") or "")
+        except Exception:
+            pass
+
+        # --- Buttons ---
+        row = QHBoxLayout()
+        self.btn_lh_apply = QPushButton("Connect")
+        self.btn_lh_apply.setProperty("secondary", True)
+
+        self.btn_lh_host = QPushButton("Start host")
+        self.btn_lh_host.setProperty("secondary", True)
+
+        self.btn_lh_stop = QPushButton("Stop host")
+        self.btn_lh_stop.setProperty("secondary", True)
+
+        row.addWidget(self.btn_lh_apply)
+        row.addWidget(self.btn_lh_host)
+        row.addWidget(self.btn_lh_stop)
+        lay.addLayout(row)
+
+        self.lbl_lh_status = QLabel("Lighthouse: (not configured)")
+        self.lbl_lh_status.setProperty("muted", True)
+        lay.addWidget(self.lbl_lh_status)
+
+        # --- Hook actions ---
+        self.btn_lh_apply.clicked.connect(self._apply_lighthouse)
+        self.btn_lh_host.clicked.connect(self._start_lighthouse_host)
+        self.btn_lh_stop.clicked.connect(self._stop_lighthouse_host)
+        self.btn_lh_add_known.clicked.connect(self._add_known_lighthouse)
+
+        # Fill dropdown now
+        try:
+            ensure_default_lighthouses()
+        except Exception:
+            pass
+        self._refresh_known_lighthouses()
+
+        return box
     def _build_dm_tab(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -385,8 +669,10 @@ class MainWindow(QMainWindow):
         self.dm_info.setProperty("muted", True)
         lay.addWidget(self.dm_info)
 
-        self.dm_log = QTextEdit()
+        self.dm_log = QTextBrowser()
+        self.dm_log.setOpenExternalLinks(False)
         self.dm_log.setReadOnly(True)
+        self.dm_log.anchorClicked.connect(self._on_dm_link)
         self.dm_log.setPlaceholderText("Direct messages will appear here…")
         lay.addWidget(self.dm_log, 2)
 
@@ -542,6 +828,15 @@ class MainWindow(QMainWindow):
     def _tick_presence(self) -> None:
         try:
             STATE.p2p.broadcast_presence()
+            try:
+                self.lbl_p2p_status.setText(
+                    f"P2P: tcp={STATE.p2p.tcp_port}  mcast={'off' if os.environ.get('P2P_DISABLE_MCAST') else 'on'}")
+                try:
+                    self._update_lh_status()
+                except Exception:
+                    pass
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -549,6 +844,12 @@ class MainWindow(QMainWindow):
         try:
             res = run_block("rooms", "", {"action": "peers"})
             peers = res.get("peers", []) or []
+            if not peers:
+                try:
+                    # direct read from live P2P directory
+                    peers = [dataclasses.asdict(p) for p in STATE.p2p.peers.list()]
+                except Exception:
+                    peers = []
             self._peers = peers
 
             self.peers_list.blockSignals(True)
@@ -593,32 +894,36 @@ class MainWindow(QMainWindow):
 
         # DM
         try:
+            dm_offers_before = len(self._dm_offers)
+
             res = run_block("private_chat", "", {"action": "feed"})
             for m in res.get("dms", []):
                 self._append_dm_msg(m)
 
+                ao = m.get("attachment_offer")
+                if isinstance(ao, dict) and ao:
+                    is_dup = any(str(x.get("offer_id")) == str(ao.get("offer_id")) for x in self._dm_offers)
+                    if not is_dup:
+                        self._dm_offers.append(ao)
+
             offers = res.get("file_offers", []) or []
             if offers:
-                self._dm_offers.extend(offers)
-                self._dm_offers = self._dm_offers[-200:]
+                for o in offers:
+                    is_dup = any(str(x.get("offer_id")) == str(o.get("offer_id")) for x in self._dm_offers)
+                    if not is_dup:
+                        self._dm_offers.append(o)
+
+            self._dm_offers = self._dm_offers[-200:]
+
+            # ONLY refresh if list changed
+            if len(self._dm_offers) != dm_offers_before:
                 self._refresh_offer_lists()
 
-            for txp in res.get("tx_pushes", []) or []:
-                self._append_dm_msg({
-                    "from_name": txp.get("from_name", "?"),
-                    "text": f"[TX WIRE RECEIVED]\n{txp.get('tx_wire','')}",
-                })
         except Exception:
             pass
 
         # Mining status (light)
         try:
-            st = run_block("mine", "", {"action": "status"})
-            running = bool(st.get("running"))
-            if running:
-                self.lbl_mine_status.setText(f"Running • threads={st.get('threads')} • intensity={st.get('intensity')}")
-            else:
-                self.lbl_mine_status.setText("Not running")
             st = run_block("mine", "", {"action": "status"})
             if st.get("running"):
                 self.lbl_mine_status.setText(
@@ -633,40 +938,193 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _refresh_known_lighthouses(self) -> None:
+        """
+        Fill dropdown from lighthouses.json.
+        Shows source badges: [S]=static [M]=manual [D]=dynamic
+        """
+        try:
+            items = list_lighthouses()
+        except Exception:
+            items = []
+
+        self.lh_known.blockSignals(True)
+        self.lh_known.clear()
+
+        seen = set()
+        for it in items:
+            addr = str(it.get("addr") or "")
+            if not addr:
+                continue
+            src = str(it.get("source") or "dynamic").lower()
+            badge = "[S]" if src == "static" else ("[M]" if src == "manual" else "[D]")
+            self.lh_known.addItem(f"{badge} {addr}", addr)
+            seen.add(addr)
+
+        # Safety: always show default static seed even if registry file missing/corrupt
+        if "170.253.163.90:38888" not in seen:
+            self.lh_known.addItem("[S] 170.253.163.90:38888", "170.253.163.90:38888")
+
+        self.lh_known.blockSignals(False)
+
+    def _add_known_lighthouse(self) -> None:
+        addr = str(self.lh_known.currentData() or "").strip()
+        if not addr:
+            return
+
+        cur = (self.lh_addr_edit.text() or "").strip()
+        parts = [p.strip() for p in cur.split(",") if p.strip()]
+        if addr not in parts:
+            parts.append(addr)
+
+        self.lh_addr_edit.setText(", ".join(parts))
+
+        # user explicitly chose it -> manual
+        try:
+            register_lighthouse(addr, source="manual", ok=None)
+        except Exception:
+            pass
+
+        self._refresh_known_lighthouses()
     # ---------------- messages / offers ----------------
     def _append_room_msg(self, m: Dict[str, Any]) -> None:
         name = safe_text(m.get("from_name", "unknown"), 64)
         text = safe_text(m.get("text", ""), 4000)
-        self.room_log.append(f"<b>{name}</b>: {text}")
+        self.room_log.append(f"<b>{h(name)}</b>: {h(text).replace('\\n', '<br>')}")
 
     def _append_dm_msg(self, m: Dict[str, Any]) -> None:
-        text = safe_text(m.get("text", ""), 4000)
-        from_name = safe_text(m.get("from_name", "unknown"), 64)
-        from_uid = str(m.get("from_user_id", "") or "")
-        to_uid = str(m.get("to_user_id", "") or "")
-        direction = str(m.get("direction", "") or "")
+        t = str(m.get("t") or "").lower()
+        text_raw = str(m.get("text") or "")
 
-        if direction == "out" or (from_uid and from_uid == self._my_user_id):
-            to_name = str(m.get("to_name", "") or "") or self._selected_peer_name()
-            label = f"You → {safe_text(to_name, 64) or 'peer'}"
-        elif direction == "in" or (to_uid and to_uid == self._my_user_id):
-            label = f"{from_name} → You"
+        from_uid = str(m.get("from_user_id") or m.get("from") or "")
+        to_uid = str(m.get("to_user_id") or m.get("to") or "")
+
+        from_name = str(m.get("from_name", "unknown") or "unknown")
+        to_name = str(m.get("to_name", "") or "")
+
+        peer_name = self._selected_peer_name()
+
+        direction = str(m.get("direction") or "").lower()
+        is_out = (direction == "out") or (from_uid and from_uid == self._my_user_id)
+
+        if is_out:
+            from_disp = "You"
+            to_disp = to_name or peer_name or "peer"
         else:
-            label = from_name
+            from_disp = from_name or peer_name or "peer"
+            to_disp = "You"
 
-        self.dm_log.append(f"<b>{label}</b>: {text}")
+        label = f"{from_disp} → {to_disp}"
+
+        if t == "tx":
+            confirmed = bool(m.get("confirmed") or m.get("ledger_synced"))
+            status = "✅ CONFIRMED" if confirmed else "⏳ PENDING"
+
+            tx_html = f"<pre style='white-space:pre-wrap; margin:6px 0'>{h(text_raw)}</pre>"
+
+            ao = m.get("attachment_offer") if isinstance(m.get("attachment_offer"), dict) else {}
+            link_html = ""
+            if isinstance(ao, dict) and ao:
+                oid = str(ao.get("offer_id") or "")
+                fname = str(ao.get("filename") or ao.get("name") or "attachment")
+                if oid:
+                    self._offer_index[oid] = ao
+                    link_html = f"<a href='offer:{h(oid)}'>⬇ Download attachment: {h(fname)}</a>"
+
+            self.dm_log.append(
+                f"<b>{h(label)}</b> <span style='color:#9aa3b7'>[{h(status)}]</span>"
+                f"{tx_html}"
+                f"{link_html if link_html else ''}"
+            )
+            return
+
+        text_html = h(text_raw).replace("\n", "<br>")
+        self.dm_log.append(f"<b>{h(label)}</b>: {text_html}")
+
+    def _on_dm_link(self, url: QUrl) -> None:
+        u = url.toString()
+        if not u.startswith("offer:"):
+            return
+
+        offer_id = u.split("offer:", 1)[1].strip()
+        offer = self._offer_index.get(offer_id)
+        if not offer:
+            QMessageBox.warning(self, "Download", "Offer not found (it may have expired).")
+            return
+
+        fname = safe_filename(offer.get("filename") or offer.get("name") or "file")
+        save_path = str(downloads_dir() / fname)
+
+        try:
+            run_block("private_chat", json.dumps(offer), {"action": "download", "save_path": save_path})
+            QMessageBox.information(self, "Downloaded", f"Saved to:\n{save_path}")
+            if is_image(save_path):
+                self._show_image_preview(save_path)
+        except Exception as e:
+            QMessageBox.warning(self, "Download failed", str(e))
 
     def _refresh_offer_lists(self) -> None:
+        # preserve current selection by offer_id
+        room_sel_oid = ""
+        dm_sel_oid = ""
+        it = self.room_offers_list.currentItem()
+        if it:
+            room_sel_oid = str(it.data(Qt.UserRole) or "")
+        it = self.dm_offers_list.currentItem()
+        if it:
+            dm_sel_oid = str(it.data(Qt.UserRole) or "")
+
+        self._offer_index = {}
+
+        # ---------- room offers ----------
+        self.room_offers_list.blockSignals(True)
         self.room_offers_list.clear()
+
         for o in self._room_offers[-120:]:
+            oid = str(o.get("offer_id") or "")
+            if oid:
+                self._offer_index[oid] = o
             size = int(o.get("size", 0) or 0)
-            self.room_offers_list.addItem(f"{o.get('from_name','?')}: {o.get('filename','file')} ({human_bytes(size)})")
 
+            txt = f"{o.get('from_name', '?')}: {o.get('filename', 'file')} ({human_bytes(size)})"
+            item = QListWidgetItem(txt)
+            item.setData(Qt.UserRole, oid)
+            self.room_offers_list.addItem(item)
+
+        # restore selection
+        if room_sel_oid:
+            for i in range(self.room_offers_list.count()):
+                it2 = self.room_offers_list.item(i)
+                if it2 and str(it2.data(Qt.UserRole) or "") == room_sel_oid:
+                    self.room_offers_list.setCurrentItem(it2)
+                    break
+
+        self.room_offers_list.blockSignals(False)
+
+        # ---------- dm offers ----------
+        self.dm_offers_list.blockSignals(True)
         self.dm_offers_list.clear()
-        for o in self._dm_offers[-120:]:
-            size = int(o.get("size", 0) or 0)
-            self.dm_offers_list.addItem(f"{o.get('from_name','?')}: {o.get('filename','file')} ({human_bytes(size)})")
 
+        for o in self._dm_offers[-120:]:
+            oid = str(o.get("offer_id") or "")
+            if oid:
+                self._offer_index[oid] = o
+            size = int(o.get("size", 0) or 0)
+
+            txt = f"{o.get('from_name', '?')}: {o.get('filename', 'file')} ({human_bytes(size)})"
+            item = QListWidgetItem(txt)
+            item.setData(Qt.UserRole, oid)
+            self.dm_offers_list.addItem(item)
+
+        # restore selection
+        if dm_sel_oid:
+            for i in range(self.dm_offers_list.count()):
+                it2 = self.dm_offers_list.item(i)
+                if it2 and str(it2.data(Qt.UserRole) or "") == dm_sel_oid:
+                    self.dm_offers_list.setCurrentItem(it2)
+                    break
+
+        self.dm_offers_list.blockSignals(False)
     # ---------------- sidebar actions ----------------
     def _join_room(self) -> None:
         room = (self.room_edit.text() or "general").strip()
@@ -674,6 +1132,11 @@ class MainWindow(QMainWindow):
             room = "general"
         try:
             run_block("rooms", "", {"action": "join", "room": room})
+            try:
+                STATE.p2p.set_room(room)
+                STATE.p2p.broadcast_presence()
+            except Exception:
+                pass
             self.room_log.append(f"<i>Joined room #{room}</i>")
             self._room_offers.clear()
             self._refresh_offer_lists()
@@ -838,6 +1301,63 @@ class MainWindow(QMainWindow):
         self.tx_to.setText(addr)
         self.tabs.setCurrentWidget(self.wallet_tab)
 
+    def _boot_network(self) -> None:
+        try:
+            # Start core P2P
+            STATE.p2p.start()
+
+            me = load_account()
+            self._my_user_id = str(me.get("user_id", "") or "")
+            self._my_name = str(me.get("name", "anon") or "anon")
+
+            avatar_path = str(me.get("avatar_path", "") or "")
+            wallet_addr = ""
+            try:
+                wallet_addr = run_block("wallet", "", {"action": "address"}).get("address", "")
+            except Exception:
+                wallet_addr = str(getattr(STATE.wallet, "address", "") or "")
+
+            STATE.p2p.set_identity(
+                user_id=self._my_user_id,
+                name=self._my_name,
+                avatar_path=avatar_path,
+                wallet_addr=wallet_addr,
+            )
+
+            STATE.p2p.set_identity(
+                user_id=self._my_user_id,
+                name=self._my_name,
+                avatar_path=avatar_path,
+                wallet_addr=wallet_addr,
+            )
+
+            # Ensure room matches UI
+            room = (self.room_edit.text() or "general").strip() or "general"
+            STATE.p2p.set_room(room)
+
+            # Optional: host lighthouse if configured
+            if getattr(self, "_lh_boot_host_on", False):
+                self._start_lighthouse_host(port=getattr(self, "_lh_boot_host_port", 38888), quiet=True)
+
+            # Connect to lighthouse list
+            addrs = parse_lh_list(self.lh_addr_edit.text() or getattr(self, "_lh_boot_addrs", ""))
+            tok = (self.lh_token_edit.text() or getattr(self, "_lh_boot_token", "")).strip()
+
+            if getattr(self, "_lh_server", None) and not addrs:
+                addrs = [f"127.0.0.1:{getattr(self, '_lh_boot_host_port', 38888)}"]
+
+            if addrs and hasattr(STATE.p2p, "connect_lighthouses"):
+                STATE.p2p.connect_lighthouses(addrs, token=tok)
+
+            STATE.p2p.broadcast_presence()
+            self._update_lh_status()
+            self._tick_peers()
+
+        except Exception as e:
+            try:
+                self.room_log.append(f"<pre>Boot network failed: {safe_text(e, 8000)}</pre>")
+            except Exception:
+                pass
     # ---------------- room actions ----------------
     def _send_room(self) -> None:
         text = self.room_input.text().strip()
@@ -868,12 +1388,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "File share blocked/failed", str(e))
 
     def _download_room_offer(self) -> None:
-        idx = self.room_offers_list.currentRow()
-        offer_slice = self._room_offers[-120:]
-        if idx < 0 or idx >= len(offer_slice):
+        it = self.room_offers_list.currentItem()
+        if not it:
+            QMessageBox.information(self, "Download", "Select a file offer first.")
             return
-        offer = offer_slice[idx]
-        save_path = str(downloads_dir() / offer.get("filename", "file"))
+
+        oid = str(it.data(Qt.UserRole) or "")
+        offer = self._offer_index.get(oid)
+        if not offer:
+            QMessageBox.warning(self, "Download", "Offer not found (it may have expired).")
+            return
+
+        fname = safe_filename(offer.get("filename", "file"))
+        save_path = str(downloads_dir() / fname)
+
         try:
             run_block("public_chat", json.dumps(offer), {"action": "download", "save_path": save_path})
             QMessageBox.information(self, "Downloaded", f"Saved to:\n{save_path}")
@@ -903,17 +1431,9 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Blocked", res.get("reason", "blocked"))
                 return
 
-            # show outgoing immediately
-            self._append_dm_msg({
-                "direction": "out",
-                "from_user_id": self._my_user_id,
-                "from_name": self._my_name,
-                "to_user_id": to_user_id,
-                "to_name": self._selected_peer_name(),
-                "text": text,
-            })
-
             self.dm_input.clear()
+            self._tick_feed()  # feels instant
+
         except Exception as e:
             QMessageBox.warning(self, "DM failed", str(e))
 
@@ -950,12 +1470,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "File send blocked/failed", str(e))
 
     def _download_dm_offer(self) -> None:
-        idx = self.dm_offers_list.currentRow()
-        offer_slice = self._dm_offers[-120:]
-        if idx < 0 or idx >= len(offer_slice):
+        it = self.dm_offers_list.currentItem()
+        if not it:
+            QMessageBox.information(self, "Download", "Select a file offer first.")
             return
-        offer = offer_slice[idx]
-        save_path = str(downloads_dir() / offer.get("filename", "file"))
+
+        oid = str(it.data(Qt.UserRole) or "")
+        offer = self._offer_index.get(oid)
+        if not offer:
+            QMessageBox.warning(self, "Download", "Offer not found (it may have expired).")
+            return
+
+        fname = safe_filename(offer.get("filename", "file"))
+        save_path = str(downloads_dir() / fname)
+
         try:
             run_block("private_chat", json.dumps(offer), {"action": "download", "save_path": save_path})
             QMessageBox.information(self, "Downloaded", f"Saved to:\n{save_path}")
@@ -963,7 +1491,6 @@ class MainWindow(QMainWindow):
                 self._show_image_preview(save_path)
         except Exception as e:
             QMessageBox.warning(self, "Download failed", str(e))
-
     def _open_downloads_folder(self) -> None:
         p = downloads_dir()
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
@@ -1126,7 +1653,8 @@ class MainWindow(QMainWindow):
     def _make_tx(self) -> None:
         to_addr = self.tx_to.text().strip()
         if not to_addr:
-            QMessageBox.information(self, "Send coins", "Enter a recipient wallet address (or select a peer and click ‘Use for payment’).")
+            QMessageBox.information(self, "Send coins",
+                                    "Enter a recipient wallet address (or select a peer and click ‘Use for payment’).")
             return
 
         try:
@@ -1137,26 +1665,176 @@ class MainWindow(QMainWindow):
                 "memo": self.tx_memo.text().strip(),
                 "file_path": self.tx_file.text().strip(),
                 "auto_submit": True,
+                "auto_confirm": True,
             }
+
             tx = run_block("transaction", "", params)
-            try:
-                if self._selected_peer:
-                    peer_uid = str(self._selected_peer.get("user_id", "") or "")
-                    peer_addr = str(self._selected_peer.get("wallet_addr", "") or "")
-                    if peer_uid and peer_addr and peer_addr == to_addr:
-                        wire = run_block("transaction", json.dumps(tx), {"action": "wire"}).get("wire", "")
-                        if wire:
-                            run_block("transaction", wire, {"action": "push_to_peer", "to_user_id": peer_uid})
-            except Exception:
-                pass
             self._last_tx_json = tx
             self.tx_output.setPlainText(json.dumps(tx, indent=2))
-            # refresh balance quickly
             self._refresh_wallet_ui()
+
+            # Try to find matching peer by wallet addr (works even if peer not selected)
+            peer_uid = ""
+            peer_name = ""
+            if self._selected_peer:
+                if str(self._selected_peer.get("wallet_addr") or "") == to_addr:
+                    peer_uid = str(self._selected_peer.get("user_id") or "")
+                    peer_name = self._selected_peer_name()
+
+            if not peer_uid:
+                for p in (self._peers or []):
+                    if str(p.get("wallet_addr") or "") == to_addr:
+                        peer_uid = str(p.get("user_id") or "")
+                        peer_name = str(p.get("name") or "peer")
+                        break
+
+            # Push tx over lighthouse or LAN (depending on peer routing)
+            if peer_uid:
+                wire = run_block("transaction", json.dumps(tx), {"action": "wire"}).get("wire", "")
+                if wire:
+                    run_block("transaction", wire, {"action": "push_to_peer", "to_user_id": peer_uid})
+
+                    # Show outgoing TX immediately in DM log
+                    self._append_dm_msg({
+                        "from_user_id": self._my_user_id,
+                        "from_name": self._my_name,
+                        "to_user_id": peer_uid,
+                        "to_name": peer_name,
+                        "text": f"[TX] Sent {int(self.tx_amount.value())} coins → {peer_name}",
+                    })
 
         except Exception as e:
             QMessageBox.warning(self, "Transaction failed", str(e))
 
+    def _apply_lighthouse(self) -> None:
+        addrs = parse_lh_list(self.lh_addr_edit.text())
+        tok = (self.lh_token_edit.text() or "").strip()
+        try:
+            for a in addrs:
+                register_lighthouse(a, source="manual", ok=None)
+        except Exception:
+            pass
+        # persist for next launch (auto-join)
+        cfg = load_gui_cfg()
+        cfg["lighthouses"] = self.lh_addr_edit.text().strip()
+        cfg["lh_token"] = tok
+        cfg["host_lighthouse"] = bool(cfg.get("host_lighthouse", False))
+        cfg["host_port"] = int(cfg.get("host_port", 38888))
+        save_gui_cfg(cfg)
+
+        try:
+            if hasattr(STATE.p2p, "connect_lighthouses"):
+                STATE.p2p.connect_lighthouses(addrs, token=tok)
+            STATE.p2p.broadcast_presence()
+        except Exception:
+            pass
+
+        self._update_lh_status()
+        self._tick_peers()
+        try:
+            self._refresh_known_lighthouses()
+        except Exception:
+            pass
+
+    def _start_lighthouse_host(self, port: Optional[int] = None, quiet: bool = False) -> None:
+        if LighthouseServer is None:
+            if not quiet:
+                QMessageBox.warning(self, "Lighthouse", "lighthouse_server.py not importable in this environment.")
+            return
+
+        if getattr(self, "_lh_server", None) is not None:
+            if not quiet:
+                QMessageBox.information(self, "Lighthouse", "Host already running.")
+            return
+
+        p = int(port or 38888)
+        try:
+            self._lh_server = LighthouseServer("0.0.0.0", p)
+            self._lh_server.start()
+
+            # auto-connect to local host if not set
+            # auto-connect to local host if UI exists and connect list is empty
+            if hasattr(self, "lh_addr_edit"):
+                try:
+                    if not self.lh_addr_edit.text().strip():
+                        self.lh_addr_edit.setText(f"127.0.0.1:{p}")
+                except Exception:
+                    pass
+
+            # remember in config (works even if UI doesn't exist yet)
+            cfg = load_gui_cfg()
+            cfg["host_lighthouse"] = True
+            cfg["host_port"] = p
+            if not cfg.get("lighthouses"):
+                if hasattr(self, "lh_addr_edit"):
+                    try:
+                        cfg["lighthouses"] = self.lh_addr_edit.text().strip()
+                    except Exception:
+                        cfg["lighthouses"] = f"127.0.0.1:{p}"
+                else:
+                    cfg["lighthouses"] = f"127.0.0.1:{p}"
+            save_gui_cfg(cfg)
+
+            # connect now only if UI exists (otherwise _boot_network will connect later)
+            if hasattr(self, "_apply_lighthouse") and hasattr(self, "lh_addr_edit"):
+                try:
+                    self._apply_lighthouse()
+                except Exception:
+                    pass
+            if not quiet:
+                QMessageBox.information(self, "Lighthouse",
+                                        f"Hosting lighthouse on port {p}.\n(You still need port-forwarding for WAN peers.)")
+        except Exception as e:
+            self._lh_server = None
+            if not quiet:
+                QMessageBox.warning(self, "Lighthouse", str(e))
+
+    def _stop_lighthouse_host(self) -> None:
+        srv = getattr(self, "_lh_server", None)
+        if not srv:
+            QMessageBox.information(self, "Lighthouse", "Host not running.")
+            return
+        try:
+            srv.stop()
+        except Exception:
+            pass
+        self._lh_server = None
+
+        cfg = load_gui_cfg()
+        cfg["host_lighthouse"] = False
+        save_gui_cfg(cfg)
+
+        self._update_lh_status()
+        QMessageBox.information(self, "Lighthouse", "Host stopped.")
+
+    def _update_lh_status(self) -> None:
+        try:
+            if hasattr(STATE.p2p, "lighthouse_status"):
+                st = STATE.p2p.lighthouse_status() or {}
+                self.lbl_lh_status.setText(
+                    f"Lighthouse: {st.get('connected', 0)}/{st.get('total', 0)} connected"
+                )
+
+                # Optional: if your status includes per-item entries, track ok/fail dynamically
+                items = st.get("items")
+                if isinstance(items, list):
+                    try:
+                        for it in items:
+                            if not isinstance(it, dict):
+                                continue
+                            addr = str(it.get("addr") or it.get("address") or "").strip()
+                            if not addr:
+                                continue
+                            ok = bool(it.get("connected") or it.get("ok") or False)
+                            register_lighthouse(addr, source="dynamic", ok=ok)
+                    except Exception:
+                        pass
+
+                return
+        except Exception:
+            pass
+
+        self.lbl_lh_status.setText("Lighthouse: (unknown)")
 
 def main() -> None:
     app = QApplication([])

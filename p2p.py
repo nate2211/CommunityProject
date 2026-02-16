@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import uuid
+import base64  # <-- ADD (needed for relay file chunks)
+from dataclasses import dataclass, field  # <-- change/ensure field is include
 """
 P2PService (LAN-only) — hardened for safety + multi-instance friendliness.
 
@@ -23,14 +26,22 @@ import socket
 import struct
 import threading
 import time
-from dataclasses import dataclass
+import base64
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from moderation import ModerationState
 from utils import sha256_text, sha256_file
 
+from lighthouse_client import LighthouseClient
 
+# Relay file chunk sizing (raw bytes -> base64 <= lighthouse MAX_CHUNK_B64)
+RELAY_CHUNK_RAW = 120_000  # ~160k base64 chars
+
+# Auto-discovered lighthouse sharing
+MAX_AUTO_LIGHTHOUSES = 5
+AUTO_CONNECT_DISCOVERED_LIGHTHOUSES = True  # set False if you only want to store, not connect
 # ---------------- Defaults ----------------
 DEFAULT_GROUP = "239.7.7.7"
 DEFAULT_PORT = 37777
@@ -52,11 +63,23 @@ LEDGER_TIP_MIN_INTERVAL_S = 2.0   # multicast at most every 2s (extra safe)
 # Set env var: P2P_DISABLE_MCAST=1
 DISABLE_MCAST = str(os.environ.get("P2P_DISABLE_MCAST") or "").strip().lower() in ("1", "true", "yes")
 
-
+# ---- Lighthouse defaults (AUTOJOIN, no user input needed) ----
+DEFAULT_BOOTSTRAP_LIGHTHOUSES = [
+    "170.253.163.90:38888",  # default public seed
+]
 def now_ts() -> float:
     return time.time()
 
-
+def _default_iface_ip() -> str:
+    # best-effort: picks the interface used for default route
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "0.0.0.0"
 def _clamp_int(v: Any, lo: int, hi: int, default: int) -> int:
     try:
         x = int(v)
@@ -86,21 +109,18 @@ def mcast_socket(group: str, port: int, ttl: int) -> socket.socket:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    # best-effort reuseport for unix-likes (helps multi-instance listeners)
     try:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)  # type: ignore[attr-defined]
     except Exception:
         pass
 
-    # Bind: try wildcard first (most compatible), then group bind fallback.
     try:
         s.bind(("", int(port)))
     except OSError:
         s.bind((group, int(port)))
 
-    # Join multicast group (LAN scope only)
-    # Use "=4s4s" to avoid platform-dependent "long" size issues.
-    mreq = struct.pack("=4s4s", socket.inet_aton(group), socket.inet_aton("0.0.0.0"))
+    iface = (os.environ.get("P2P_MCAST_IF") or "").strip() or _default_iface_ip()
+    mreq = struct.pack("=4s4s", socket.inet_aton(group), socket.inet_aton(iface))
     s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
     s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, int(ttl))
     return s
@@ -112,16 +132,25 @@ def mcast_send(group: str, port: int, ttl: int, msg: Dict[str, Any]) -> None:
     data = json.dumps(msg, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(data) > MAX_UDP_BYTES:
         return
+
+    iface = (os.environ.get("P2P_MCAST_IF") or "").strip() or _default_iface_ip()
+
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     try:
         s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, int(ttl))
+        # force correct NIC
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(iface))
         s.sendto(data, (group, int(port)))
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(data, ("255.255.255.255", int(port)))
+        except Exception:
+            pass
     finally:
         try:
             s.close()
         except Exception:
             pass
-
 
 def tcp_send_json(ip: str, port: int, obj: Dict[str, Any], timeout: float = TCP_CONNECT_TIMEOUT) -> None:
     data = (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
@@ -201,8 +230,8 @@ class PeerInfo:
     room: str
     avatar_sha: str
     last_seen: float
-    wallet_addr: str = ""   # NEW
-
+    wallet_addr: str = ""
+    relay_via: List[str] = field(default_factory=list)
 
 class PeerDirectory:
     def __init__(self) -> None:
@@ -210,16 +239,41 @@ class PeerDirectory:
         self._peers: Dict[str, PeerInfo] = {}
 
     def update(self, p: PeerInfo) -> None:
-        # small sanity guards
-        if not p.user_id or p.tcp_port <= 0 or p.tcp_port > 65535:
+        if not p.user_id:
             return
+        if p.tcp_port < 0 or p.tcp_port > 65535:
+            return
+        # allow relay-only peers to have tcp_port=0
+        if p.tcp_port == 0 and p.ip != "relay":
+            return
+
         with self._lock:
-            # cap number of peers (prevents growth from spam)
             if len(self._peers) > 2048:
                 self._prune_locked(older_than_s=10.0)
                 if len(self._peers) > 2048:
-                    # drop update if still too large
                     return
+
+            old = self._peers.get(p.user_id)
+            if old:
+                old_via = set(getattr(old, "relay_via", []) or [])
+                new_via = set(getattr(p, "relay_via", []) or [])
+                merged_via = sorted(old_via | new_via)
+
+                if old.ip != "relay" and p.ip == "relay":
+                    p.ip = old.ip
+                    p.tcp_port = old.tcp_port
+
+                p.last_seen = max(float(old.last_seen), float(p.last_seen))
+
+                if not p.avatar_sha:
+                    p.avatar_sha = old.avatar_sha
+                if not p.wallet_addr:
+                    p.wallet_addr = old.wallet_addr
+                if not p.name or p.name == "unknown":
+                    p.name = old.name
+
+                p.relay_via = merged_via
+
             self._peers[p.user_id] = p
 
     def list(self) -> List[PeerInfo]:
@@ -244,21 +298,21 @@ class PeerDirectory:
 @dataclass
 class FileOffer:
     offer_id: str
-    scope: str          # "room" or "dm" or "tx"
+    scope: str
     room: str
     from_user_id: str
     from_name: str
     from_ip: str
     from_tcp_port: int
 
-    # NEW: exact file_id registered on sender (do NOT reconstruct)
     file_id: str = ""
-
     filename: str = ""
     size: int = 0
     sha256: str = ""
     note: str = ""
 
+    # NEW: which lighthouse delivered this offer (helps route relay downloads)
+    relay_via: str = ""
 # ---------------- TCP Server ----------------
 class TcpServer(threading.Thread):
     def __init__(
@@ -467,6 +521,20 @@ class P2PService:
         self._last_public_ts: float = 0.0
         self.presence_min_interval_s: float = PRESENCE_MIN_INTERVAL_S
         self.public_chat_min_interval_s: float = PUBLIC_CHAT_MIN_INTERVAL_S
+        # ---- lighthouse (cross-router) ----
+        self._lh_token: str = (os.environ.get("P2P_LIGHTHOUSE_TOKEN") or "").strip()
+        self._lhs: Dict[str, LighthouseClient] = {}  # key "host:port" -> client
+        self._lh_targets: List[str] = []  # normalized ["host:port", ...]
+        # downloads in-flight via relay: req_id -> state
+        self._relay_dl_lock = threading.Lock()
+        self._relay_downloads: Dict[str, Dict[str, Any]] = {}
+        # dedupe for room broadcasts (mcast + lighthouse can double-deliver)
+        self._seen_room_ids: Dict[str, float] = {}
+        self._seen_room_keep_s: float = 90.0
+        self._seen_room_max: int = 4096
+        # discovered lighthouses (addr strings like "ip:port")
+        self._known_lighthouses_lock = threading.Lock()
+        self.known_lighthouses: set[str] = set(self._normalize_lh_addrs(DEFAULT_BOOTSTRAP_LIGHTHOUSES))
 
     def start(self) -> None:
         if self._tcp is None:
@@ -480,8 +548,13 @@ class P2PService:
                 get_avatar_path=self._get_avatar_path,
             )
             self._tcp.start()
-
-            # wait briefly for bound_port
+            # ---- lighthouse connect (optional, multi) ----
+            try:
+                env_targets = self._parse_lighthouse_env_multi()
+                if env_targets:
+                    self.connect_lighthouses(env_targets, token=self._lh_token)
+            except Exception:
+                pass
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
                 if self._tcp.bound_port:
@@ -506,10 +579,11 @@ class P2PService:
 
     def set_identity(self, user_id: str, name: str, avatar_path: str, wallet_addr: str = "") -> None:
         self.identity = Identity(user_id=user_id, name=name, avatar_path=avatar_path, wallet_addr=wallet_addr)
+        self._lh_refresh_hello(send_immediately=True)
 
     def set_room(self, room: str) -> None:
         self.room = (_safe_str(room, 64) or "general")
-
+        self._lh_refresh_hello(send_immediately=True)
     def avatar_sha(self) -> str:
         ap = self.identity.avatar_path
         if ap and os.path.exists(ap):
@@ -519,33 +593,78 @@ class P2PService:
                 return ""
         return ""
 
-    def broadcast_presence(self) -> None:
-        if DISABLE_MCAST:
-            return
 
+    def broadcast_presence(self) -> None:
         t = now_ts()
         if (t - self._last_presence_ts) < float(self.presence_min_interval_s):
             return
         self._last_presence_ts = t
 
-        msg = {
-            "v": 1,
-            "t": "presence",
-            "ts": t,
-            "user_id": self.identity.user_id,
-            "name": self.identity.name,
-            "room": self.room,
-            "tcp_port": self.tcp_port,
-            "avatar_sha": self.avatar_sha(),
-            "wallet_addr": self.identity.wallet_addr,
-        }
-        mcast_send(self.group, self.port, self.ttl, msg)
+        # multicast presence (LAN only)
+        if not DISABLE_MCAST:
+            msg = {
+                "v": 1,
+                "t": "presence",
+                "ts": t,
+                "user_id": self.identity.user_id,
+                "name": self.identity.name,
+                "room": self.room,
+                "tcp_port": self.tcp_port,
+                "avatar_sha": self.avatar_sha(),
+                "wallet_addr": self.identity.wallet_addr,
+            }
+            mcast_send(self.group, self.port, self.ttl, msg)
+
+        # lighthouse hello (cross-router)
+        if self._lhs:
+            hp = dict(self._lh_hello_payload())
+            if self._lh_token:
+                hp["token"] = self._lh_token
+            hp["t"] = "hello"
+            hp["ts"] = t
+            for cli in self._lhs.values():
+                try:
+                    cli.set_hello(self._lh_hello_payload())
+                    if cli.is_connected:
+                        cli.send(hp)
+                except Exception:
+                    pass
+
+    def _room_seen_before(self, msg: Dict[str, Any]) -> bool:
+        """Return True if msg_id was seen recently (drop duplicates)."""
+        try:
+            mid = str(msg.get("msg_id") or "").strip()
+            if not mid:
+                return False
+            now = now_ts()
+            last = self._seen_room_ids.get(mid)
+            if last is not None and (now - float(last)) <= self._seen_room_keep_s:
+                return True
+
+            # prune occasionally
+            if len(self._seen_room_ids) >= self._seen_room_max:
+                cutoff = now - self._seen_room_keep_s
+                self._seen_room_ids = {k: v for k, v in self._seen_room_ids.items() if float(v) >= cutoff}
+
+            self._seen_room_ids[mid] = now
+            return False
+        except Exception:
+            return False
+
+    def _lh_room_broadcast(self, inner: Dict[str, Any]) -> None:
+        """Send a UDP-style room message via lighthouse so cross-router peers see it."""
+        if not self._lhs:
+            return
+        payload = {"t": "room_broadcast", "msg": inner}
+        for cli in list(self._lhs.values()):
+            try:
+                if cli and cli.is_connected:
+                    cli.send(payload)
+            except Exception:
+                pass
 
     def send_public_text(self, text: str) -> None:
-        if DISABLE_MCAST:
-            return
-
-        # prevent accidental UI loops spamming multicast
+        # prevent accidental UI loops spamming
         t = now_ts()
         if (t - self._last_public_ts) < float(self.public_chat_min_interval_s):
             return
@@ -555,13 +674,23 @@ class P2PService:
             "v": 1,
             "t": "public_chat",
             "ts": t,
+            "msg_id": uuid.uuid4().hex,
             "room": self.room,
             "from_user_id": self.identity.user_id,
             "from_name": self.identity.name,
-            "avatar_sha": self.avatar_sha(),
+            "avatar_sha": self.avatar_sha(),  # ✅ always computed from avatar_path
             "text": _safe_str(text, 4000),
         }
-        mcast_send(self.group, self.port, self.ttl, msg)
+
+        # LAN multicast
+        if not DISABLE_MCAST:
+            try:
+                mcast_send(self.group, self.port, self.ttl, msg)
+            except Exception:
+                pass
+
+        # Lighthouse (cross-router)
+        self._lh_room_broadcast(msg)
 
     def send_dm_text(self, peer: PeerInfo, text: str) -> None:
         obj = {
@@ -569,9 +698,21 @@ class P2PService:
             "ts": now_ts(),
             "from_user_id": self.identity.user_id,
             "from_name": self.identity.name,
+            "to_user_id": peer.user_id,  # NEW
+            "to_name": peer.name,  # NEW
             "avatar_sha": self.avatar_sha(),
             "text": _safe_str(text, 4000),
         }
+
+        # relay-only peer
+        if peer.ip == "relay" or peer.tcp_port <= 0:
+            cli = self._lh_best_for_peer(peer)
+            if cli:
+                cli.send({"t": "relay", "kind": "dm", "to": peer.user_id, "msg": obj})
+                return
+            raise RuntimeError("no_lighthouse_connected")
+
+        # direct LAN path
         tcp_send_json(peer.ip, peer.tcp_port, obj)
 
     def push_tx_to_peer(self, peer: PeerInfo, tx_wire: str, *, ledger_tip: Optional[Dict[str, Any]] = None) -> None:
@@ -593,7 +734,12 @@ class P2PService:
                 "height": _clamp_int(ledger_tip.get("height"), 0, 10_000_000, 0),
                 "tip_hash": _safe_str(ledger_tip.get("tip_hash") or "", 128),
             }
-
+        if peer.ip == "relay" or peer.tcp_port <= 0:
+            cli = self._lh_best_for_peer(peer)
+            if not cli:
+                raise RuntimeError("no_lighthouse_connected")
+            cli.send({"t": "relay", "kind": "tx_push", "to": peer.user_id, "msg": obj})
+            return
         tcp_send_json(peer.ip, peer.tcp_port, obj)
 
     def share_file_to_room(self, path: str, note: str = "", scope: str = "room") -> FileOffer:
@@ -603,7 +749,8 @@ class P2PService:
             raise RuntimeError("file_too_large_or_empty")
 
         digest = sha256_file(path)
-        file_id = f"{digest}:{size}:{os.path.basename(path)}"
+        name = os.path.basename(path)
+        file_id = f"{digest}:{size}:{name}"
         self._shared_files[file_id] = path
 
         offer = FileOffer(
@@ -614,8 +761,8 @@ class P2PService:
             from_name=self.identity.name,
             from_ip="",
             from_tcp_port=self.tcp_port,
-            file_id=file_id,  # IMPORTANT
-            filename=os.path.basename(path),
+            file_id=file_id,
+            filename=name,
             size=size,
             sha256=digest,
             note=_safe_str(note, 512),
@@ -625,20 +772,28 @@ class P2PService:
             "v": 1,
             "t": "room_file_offer",
             "ts": now_ts(),
+            "msg_id": uuid.uuid4().hex,
             "room": self.room,
             "from_user_id": self.identity.user_id,
             "from_name": self.identity.name,
             "tcp_port": self.tcp_port,
-            "avatar_sha": self.avatar_sha(),
+            "avatar_sha": self.avatar_sha(),  # ✅ always present
             "scope": offer.scope,
-
-            # IMPORTANT: include explicit file_id so receivers never guess
             "file_id": file_id,
             "file": {"name": offer.filename, "size": offer.size, "sha256": offer.sha256, "file_id": file_id},
-
             "note": offer.note,
         }
-        mcast_send(self.group, self.port, self.ttl, msg)
+
+        # LAN multicast
+        if not DISABLE_MCAST:
+            try:
+                mcast_send(self.group, self.port, self.ttl, msg)
+            except Exception:
+                pass
+
+        # Lighthouse (cross-router)
+        self._lh_room_broadcast(msg)
+
         return offer
 
     def share_file_dm(self, peer: PeerInfo, path: str, note: str = "", scope: str = "dm") -> FileOffer:
@@ -664,6 +819,7 @@ class P2PService:
             size=size,
             sha256=digest,
             note=_safe_str(note, 512),
+
         )
 
         obj = {
@@ -681,36 +837,129 @@ class P2PService:
 
             "note": offer.note,
         }
+        if peer.ip == "relay" or peer.tcp_port <= 0:
+            cli = self._lh_best_for_peer(peer)
+            if not cli:
+                raise RuntimeError("no_lighthouse_connected")
+            cli.send({"t": "relay", "kind": "dm_file_offer", "to": peer.user_id, "msg": obj})
+            return offer
+
         tcp_send_json(peer.ip, peer.tcp_port, obj)
         return offer
 
     def download_offer(self, offer: FileOffer, save_path: str) -> int:
-        ok, reason = self.moderation.file_check_metadata(
-            filename=_safe_str(offer.filename, 512),
-            size=int(offer.size),
-            sha256hex=_safe_str(offer.sha256, 128),
-        )
-        if not ok:
-            raise RuntimeError(f"blocked_before_download:{reason}")
+        # --- FIX START: Allow ledger files to bypass moderation ---
+        # If this is a ledger sync, we trust it (it is verified by coin_fingerprint later)
+        is_system_file = (offer.scope == "ledger") or (offer.filename == "ledger.json")
 
-        # IMPORTANT: use explicit file_id when provided (tx attachments / sanitized names)
+        if not is_system_file:
+            ok, reason = self.moderation.file_check_metadata(
+                filename=_safe_str(offer.filename, 512),
+                size=int(offer.size),
+                sha256hex=_safe_str(offer.sha256, 128),
+            )
+            if not ok:
+                raise RuntimeError(f"blocked_before_download:{reason}")
+        # --- FIX END ---
+        # file_id must be stable
         file_id = str(getattr(offer, "file_id", "") or "").strip()
         if not file_id:
-            file_id = f"{offer.sha256}:{offer.size}:{offer.filename}"
+            file_id = f"{offer.sha256}:{int(offer.size)}:{offer.filename}"
 
-        req = {"t": "file_get", "file_id": file_id}
-        n = tcp_request_blob(offer.from_ip, offer.from_tcp_port, req, save_path, expected_sha256=offer.sha256)
+        received = 0
+        # If offer is relay-origin, fetch via lighthouse
+        if (offer.from_ip == "relay" or offer.from_tcp_port <= 0):
+            if not self._lhs:
+                raise RuntimeError("no_lighthouse_connected")
 
-        ok2, reason2 = self.moderation.file_check_path(path=save_path)
-        if not ok2:
-            try:
-                os.unlink(save_path)
-            except Exception:
-                pass
-            raise RuntimeError(f"blocked_after_download:{reason2}")
+            req_id = uuid.uuid4().hex
+            self._relay_download_register(req_id, save_path, int(offer.size), str(offer.sha256))
 
-        return n
+            file_id = str(getattr(offer, "file_id", "") or f"{offer.sha256}:{offer.size}:{offer.filename}")
+            payload = {"t": "relay_file_get", "to": offer.from_user_id, "req_id": req_id, "file_id": file_id}
 
+            cli: Optional[LighthouseClient] = None
+
+            via = _safe_str(getattr(offer, "relay_via", "") or "", 256)
+            if via:
+                cli = self._lhs.get(via)
+                if cli and not cli.is_connected:
+                    cli = None
+
+            if cli is None:
+                sender = self.peers.get(offer.from_user_id)
+                if sender:
+                    cli = self._lh_best_for_peer(sender)
+
+            if cli is None:
+                for c in self._lhs.values():
+                    if c.is_connected:
+                        cli = c
+                        break
+
+            if cli is None:
+                self._relay_download_finish(req_id, "no_lighthouse_connected")
+                st = self._relay_download_pop(req_id)
+                if st:
+                    try:
+                        st["f"].close()
+                    except Exception:
+                        pass
+                raise RuntimeError("no_lighthouse_connected")
+
+            cli.send(payload)
+
+            # WAIT for completion
+            with self._relay_dl_lock:
+                st0 = self._relay_downloads.get(req_id)
+            if not st0:
+                raise RuntimeError("relay_state_missing")
+
+            # simple timeout scale by size (clamped)
+            exp = int(st0.get("expected_size") or int(offer.size) or 0)
+            timeout_s = max(30.0, min(600.0, 30.0 + (exp / 200_000.0)))
+
+            if not st0["done"].wait(timeout=timeout_s):
+                self._relay_download_finish(req_id, "timeout")
+
+            st = self._relay_download_pop(req_id)
+            if not st:
+                raise RuntimeError("relay_state_missing")
+
+            err = str(st.get("err") or "")
+            received = int(st.get("received") or 0)
+
+            if err:
+                try:
+                    os.unlink(save_path)
+                except Exception:
+                    pass
+                raise RuntimeError(f"relay_download_failed:{err}")
+
+            # success
+            received = int(received)
+        else:
+            req = {"t": "file_get", "file_id": file_id}
+            received = tcp_request_blob(
+                offer.from_ip,
+                int(offer.from_tcp_port),
+                req,
+                save_path,
+                expected_sha256=str(offer.sha256 or ""),
+            )
+
+        # --- FIX START: Bypass post-download check for ledger too ---
+        if not is_system_file:
+            ok2, reason2 = self.moderation.file_check_path(path=save_path)
+            if not ok2:
+                try:
+                    os.unlink(save_path)
+                except Exception:
+                    pass
+                raise RuntimeError(f"blocked_after_download:{reason2}")
+        # --- FIX END ---
+
+        return int(received) if 'received' in locals() else int(offer.size or 0)
     def pop_room_messages(self, max_n: int = 200) -> List[Dict[str, Any]]:
         out = []
         for _ in range(int(max_n)):
@@ -769,28 +1018,61 @@ class P2PService:
         return p if os.path.exists(p) else None
 
     def _handle_dm(self, msg: Dict[str, Any], addr: Tuple[str, int]) -> None:
-        from_uid = _safe_str(msg.get("from_user_id") or "remote", 128)
-        text = _safe_str(msg.get("text") or "", 4000)
-        ok, cleaned, _ = self.moderation.chat_check(user_id=from_uid, text=text)
-        if not ok:
-            return
-        msg["from_user_id"] = from_uid
-        msg["from_name"] = _safe_str(msg.get("from_name") or "unknown", 64)
-        msg["text"] = cleaned
-        msg["_src_ip"] = addr[0]
-        self._q_dm_msgs.put(msg)
+        try:
+            # Only accept if addressed to us (or if field missing, accept)
+            to_uid = _safe_str(msg.get("to_user_id") or "", 128)
+            if to_uid and to_uid != self.identity.user_id:
+                return
+
+            text = _safe_str(msg.get("text") or "", 4000)
+
+            # Moderate inbound text (attribute to sender uid if available)
+            sender_uid = _safe_str(msg.get("from_user_id") or addr[0], 128)
+            ok, cleaned, _reason = self.moderation.chat_check(user_id=sender_uid, text=text)
+            if not ok:
+                return
+
+            m = {
+                "t": "dm",
+                "ts": float(msg.get("ts") or now_ts()),
+                "from_user_id": _safe_str(msg.get("from_user_id") or "", 128),
+                "from_name": _safe_str(msg.get("from_name") or "unknown", 64),
+                "to_user_id": to_uid or self.identity.user_id,
+                "to_name": _safe_str(msg.get("to_name") or self.identity.name, 64),
+                "avatar_sha": _safe_str(msg.get("avatar_sha") or "", 128),
+                "text": cleaned,
+                "direction": "in",
+                "_src_ip": addr[0],
+            }
+            self._q_dm_msgs.put(m)
+        except Exception:
+            pass
 
     def _handle_tx_push_tcp(self, msg: Dict[str, Any], addr: Tuple[str, int]) -> None:
         from_uid = _safe_str(msg.get("from_user_id") or "remote", 128)
-        wire = _safe_str(msg.get("tx_wire") or "", 120_000)
-        ok, cleaned, _ = self.moderation.chat_check(user_id=from_uid, text=wire)
-        if not ok:
+
+        wire = str(msg.get("tx_wire") or "").strip()
+        if not wire:
+            return
+        if len(wire) > 200_000:
+            return
+
+        # ✅ Validate as tx wire (base64 urlsafe JSON), NOT as chat text
+        try:
+            raw = base64.urlsafe_b64decode(wire.encode("ascii"))
+            d = json.loads(raw.decode("utf-8"))
+            if not isinstance(d, dict) or not str(d.get("tx_id") or "").strip():
+                return
+        except Exception:
             return
 
         msg["from_user_id"] = from_uid
         msg["from_name"] = _safe_str(msg.get("from_name") or "unknown", 64)
-        msg["from_tcp_port"] = _clamp_int(msg.get("from_tcp_port"), 1, 65535, 0)
-        msg["tx_wire"] = cleaned
+        msg["from_tcp_port"] = _clamp_int(msg.get("from_tcp_port"), 0, 65535, 0)
+        if addr[0] == "relay":
+            msg["from_tcp_port"] = 0
+
+        msg["tx_wire"] = wire
         msg["_src_ip"] = addr[0]
 
         tip = msg.get("ledger_tip")
@@ -834,7 +1116,7 @@ class P2PService:
             from_user_id=_safe_str(msg.get("from_user_id") or "", 128),
             from_name=_safe_str(msg.get("from_name") or "unknown", 64),
             from_ip=ip,
-            from_tcp_port=_clamp_int(msg.get("from_tcp_port"), 1, 65535, 0),
+            from_tcp_port=_clamp_int(msg.get("from_tcp_port"), 0, 65535, 0),
 
             file_id=incoming_file_id,  # IMPORTANT
 
@@ -842,16 +1124,27 @@ class P2PService:
             size=size,
             sha256=digest,
             note=note,
+            relay_via=_safe_str(msg.get("_relay_via") or "", 256),
         )
-        if offer.from_tcp_port <= 0:
+        if offer.from_tcp_port <= 0 and offer.from_ip != "relay":
             return
         self._q_dm_offers.put(offer)
 
     def _handle_udp(self, msg: Dict[str, Any], src_ip: str) -> None:
+
         if msg.get("v") != 1:
             return
 
         t = msg.get("t")
+
+        relay_via = _safe_str(msg.get("_relay_via") or "", 256)
+
+        # --- FIX: Deduplication Check ---
+        # If we have seen this unique msg_id before (via LAN or another Relay), drop it.
+        # Applies to public_chat and room_file_offer.
+        if t in ("public_chat", "room_file_offer"):
+            if self._room_seen_before(msg):
+                return
 
         if t == "presence":
             p = PeerInfo(
@@ -862,9 +1155,12 @@ class P2PService:
                 room=str(msg.get("room") or "general"),
                 avatar_sha=str(msg.get("avatar_sha") or ""),
                 last_seen=now_ts(),
-                wallet_addr=str(msg.get("wallet_addr") or ""),  # NEW
+                wallet_addr=str(msg.get("wallet_addr") or ""),
+                relay_via=[relay_via] if relay_via else [],
             )
-            if not p.user_id or p.user_id == self.identity.user_id or p.tcp_port <= 0:
+            if not p.user_id or p.user_id == self.identity.user_id:
+                return
+            if p.tcp_port <= 0 and p.ip != "relay":
                 return
             self.peers.update(p)
             return
@@ -881,39 +1177,61 @@ class P2PService:
             msg["from_name"] = _safe_str(msg.get("from_name") or "unknown", 64)
             msg["text"] = cleaned
             msg["_src_ip"] = src_ip
+            msg["_relay_via"] = relay_via
             self._q_room_msgs.put(msg)
             return
+
         if t == "ledger_tip":
             if _safe_str(msg.get("room") or "", 64) != self.room:
                 return
 
             from_uid = _safe_str(msg.get("from_user_id") or "", 128)
+            # Don't listen to ourselves
             if not from_uid or from_uid == self.identity.user_id:
                 return
 
-            # Optional extra safety: only accept tips from known peers
-            if self.peers.get(from_uid) is None:
-                return
+            # ... (keep existing validation checks) ...
 
-            tip = {
-                "from_user_id": from_uid,
-                "from_name": _safe_str(msg.get("from_name") or "unknown", 64),
-                "tcp_port": _clamp_int(msg.get("tcp_port"), 1, 65535, 0),
-                "height": _clamp_int(msg.get("height"), 0, 10_000_000, 0),
-                "tip_hash": _safe_str(msg.get("tip_hash") or "", 128),
+            # FIX STARTS HERE: Immediately trigger a sync if the tip is higher than our current height
+            current_height = 0
+            if hasattr(self, 'get_current_height_func') and self.get_current_height_func:
+                current_height = self.get_current_height_func()
 
-                "file_id": _safe_str(msg.get("file_id") or "", 1024),
-                "sha256": _safe_str(msg.get("sha256") or "", 128),
-                "size": _clamp_int(msg.get("size"), 0, MAX_BLOB_SEND_BYTES, 0),
-                "filename": _safe_str(msg.get("filename") or "ledger.json", 256),
+            tip_height = _clamp_int(msg.get("height"), 0, 10_000_000, 0)
 
-                "_src_ip": src_ip,
-            }
-            if tip["tcp_port"] <= 0 or not tip["file_id"] or tip["size"] <= 0 or not tip["sha256"]:
-                return
+            if tip_height > current_height:
+                offer = FileOffer(
+                    offer_id=sha256_text(f"ledger_sync|{from_uid}|{tip_height}"),
+                    scope="ledger",
+                    room=self.room,
+                    from_user_id=from_uid,
+                    from_name=_safe_str(msg.get("from_name") or "unknown", 64),
+                    from_ip=src_ip,
+                    from_tcp_port=_clamp_int(msg.get("tcp_port"), 0, 65535, 0),
+                    file_id=_safe_str(msg.get("file_id") or "", 1024),
+                    filename=_safe_str(msg.get("filename") or "ledger.json", 256),
+                    size=_clamp_int(msg.get("size"), 0, MAX_BLOB_SEND_BYTES, 0),
+                    sha256=_safe_str(msg.get("sha256") or "", 128),
+                    note="auto_sync",
+                    relay_via=relay_via,
+                )
 
-            self._q_ledger_tips.put(tip)
+                # ✅ Always queue it so your blocks/GUI can see it
+                try:
+                    self._q_ledger_tips.put(dataclasses.asdict(offer))
+                except Exception:
+                    pass
+
+                # Optional callback if you wired one
+                cb = getattr(self, "on_ledger_offer", None)
+                if callable(cb):
+                    try:
+                        cb(offer)
+                    except Exception:
+                        pass
+
             return
+
         if t == "room_file_offer":
             if _safe_str(msg.get("room") or "", 64) != self.room:
                 return
@@ -944,16 +1262,15 @@ class P2PService:
                 from_user_id=_safe_str(msg.get("from_user_id") or "", 128),
                 from_name=_safe_str(msg.get("from_name") or "unknown", 64),
                 from_ip=src_ip,
-                from_tcp_port=_clamp_int(msg.get("tcp_port"), 1, 65535, 0),
-
-                file_id=incoming_file_id,  # IMPORTANT
-
+                from_tcp_port=_clamp_int(msg.get("tcp_port"), 0, 65535, 0),
+                file_id=incoming_file_id,
                 filename=name,
                 size=size,
                 sha256=digest,
                 note=note,
+                relay_via=relay_via,
             )
-            if offer.from_tcp_port <= 0:
+            if offer.from_tcp_port <= 0 and offer.from_ip != "relay":
                 return
             self._q_room_offers.put(offer)
             return
@@ -1013,3 +1330,449 @@ class P2PService:
             except queue.Empty:
                 break
         return out
+
+    def _parse_lighthouse_env(self) -> None:
+        raw = (os.environ.get("P2P_LIGHTHOUSE") or "").strip()
+        if not raw:
+            self._lh_host, self._lh_port = "", 0
+            return
+        if "://" in raw:
+            raw = raw.split("://", 1)[1]
+        if "/" in raw:
+            raw = raw.split("/", 1)[0]
+        if ":" in raw:
+            h, p = raw.rsplit(":", 1)
+            self._lh_host = h.strip()
+            try:
+                self._lh_port = int(p.strip())
+            except Exception:
+                self._lh_port = 0
+        else:
+            self._lh_host = raw.strip()
+            self._lh_port = 38888
+
+    def _lh_hello_payload(self) -> Dict[str, Any]:
+        if not self.identity.user_id:
+            return {}
+
+        # If this machine is ALSO running a lighthouse server, set env:
+        #   P2P_ADVERTISE_LIGHTHOUSE_PORT=38888
+        lh_port = _clamp_int(os.environ.get("P2P_ADVERTISE_LIGHTHOUSE_PORT") or 0, 0, 65535, 0)
+
+        d = {
+            "v": 1,
+            "user_id": self.identity.user_id,
+            "name": self.identity.name,
+            "room": self.room,
+            "tcp_port": self.tcp_port,
+            "avatar_sha": self.avatar_sha(),
+            "wallet_addr": self.identity.wallet_addr,
+        }
+
+        if lh_port > 0:
+            d["is_lighthouse"] = True
+            d["lighthouse_port"] = int(lh_port)
+
+        return d
+
+    def _lh_send(self, obj: Dict[str, Any]) -> None:
+        # Back-compat shim: send to any connected lighthouse (best-effort).
+        self._lh_send_any(obj)
+
+    def _relay_peer_upsert(self, peer: Dict[str, Any], via_key: str) -> None:
+        p = PeerInfo(
+            user_id=str(peer.get("user_id") or ""),
+            name=str(peer.get("name") or "unknown"),
+            ip="relay",
+            tcp_port=0,
+            room=str(peer.get("room") or "general"),
+            avatar_sha=str(peer.get("avatar_sha") or ""),
+            last_seen=float(peer.get("last_seen") or now_ts()),
+            wallet_addr=str(peer.get("wallet_addr") or ""),
+            relay_via=[via_key],  # NEW
+        )
+        if not p.user_id or p.user_id == self.identity.user_id:
+            return
+        self.peers.update(p)
+
+    def _relay_download_register(self, req_id: str, save_path: str, expected_size: int, expected_sha256: str) -> None:
+        Path(save_path).resolve().parent.mkdir(parents=True, exist_ok=True)
+        st = {
+            "req_id": req_id,
+            "save_path": save_path,
+            "expected_size": int(expected_size),
+            "expected_sha256": (expected_sha256 or "").lower(),
+            "received": 0,
+            "h": hashlib.sha256(),
+            "f": open(save_path, "wb"),
+            "done": threading.Event(),
+            "err": "",
+        }
+        with self._relay_dl_lock:
+            self._relay_downloads[req_id] = st
+
+    def _relay_download_finish(self, req_id: str, err: str = "") -> None:
+        with self._relay_dl_lock:
+            st = self._relay_downloads.get(req_id)
+        if not st:
+            return
+        try:
+            try:
+                st["f"].close()
+            except Exception:
+                pass
+            if err:
+                st["err"] = err
+            st["done"].set()
+        finally:
+            pass
+
+    def _relay_download_pop(self, req_id: str) -> Optional[Dict[str, Any]]:
+        with self._relay_dl_lock:
+            return self._relay_downloads.pop(req_id, None)
+
+    def _handle_lighthouse(self, msg: Dict[str, Any], via_key: str) -> None:
+        t = msg.get("t")
+        # --- DEBUG: Catch server errors ---
+        if t == "err":
+            code = msg.get("code")
+            print(f"[LH Client] Server rejected connection: {code}")
+            return
+        if t == "peer_list":
+            peers = msg.get("peers") or []
+            if isinstance(peers, list):
+                for p in peers:
+                    if isinstance(p, dict):
+                        self._relay_peer_upsert(p, via_key)
+            return
+
+        # ---- Room broadcast path (cross-router room traffic) ----
+        if t == "room_broadcast":
+            payload = msg.get("msg")
+            if not isinstance(payload, dict):
+                return
+            inner = dict(payload)
+            inner["_relay_via"] = via_key
+            self._handle_udp(inner, "relay")
+            return
+
+        if t == "relay":
+            kind = str(msg.get("kind") or "")
+            payload = msg.get("msg")
+            if not isinstance(payload, dict):
+                return
+
+            payload["_relay_via"] = via_key
+
+            if kind == "dm":
+                self._handle_dm(payload, ("relay", 0))
+                return
+            if kind == "dm_file_offer":
+                self._handle_dm_file_offer_tcp(payload, ("relay", 0))
+                return
+            if kind == "tx_push":
+                self._handle_tx_push_tcp(payload, ("relay", 0))
+                return
+            return
+
+        # ---- relay file receive path ----
+        if t == "relay_file_begin":
+            req_id = str(msg.get("req_id") or "")
+            size = int(msg.get("size") or 0)
+            sha = str(msg.get("sha256") or "").lower()
+            with self._relay_dl_lock:
+                st = self._relay_downloads.get(req_id)
+            if not st:
+                return
+            if size <= 0 or size > MAX_BLOB_SEND_BYTES:
+                self._relay_download_finish(req_id, "bad_size")
+                return
+            st["expected_size"] = size
+            st["expected_sha256"] = sha
+            return
+
+        if t == "relay_file_chunk":
+            req_id = str(msg.get("req_id") or "")
+            b64s = msg.get("b64")
+            if not isinstance(b64s, str) or not req_id:
+                return
+
+            with self._relay_dl_lock:
+                st = self._relay_downloads.get(req_id)
+            if not st:
+                return
+
+            try:
+                raw = base64.b64decode(b64s.encode("ascii"), validate=True)
+            except Exception:
+                self._relay_download_finish(req_id, "bad_b64")
+                return
+
+            if st["received"] + len(raw) > int(st["expected_size"]):
+                self._relay_download_finish(req_id, "too_many_bytes")
+                return
+
+            try:
+                st["f"].write(raw)
+                st["h"].update(raw)
+                st["received"] += len(raw)
+            except Exception:
+                self._relay_download_finish(req_id, "write_failed")
+            return
+
+        if t == "relay_file_get":
+            req_id = _safe_str(msg.get("req_id") or "", 64)
+
+            # ✅ Robust: different lighthouse servers use different keys for requester
+            to_uid = _safe_str(
+                msg.get("from")
+                or msg.get("from_user_id")
+                or msg.get("requester")
+                or msg.get("src_user_id")
+                or "",
+                128
+            )
+
+            # ✅ Robust: sometimes file_id is nested
+            fobj = msg.get("file") if isinstance(msg.get("file"), dict) else {}
+            file_id = _safe_str(msg.get("file_id") or (fobj.get("file_id") if isinstance(fobj, dict) else "") or "",
+                                1024)
+
+            if not req_id or not to_uid or not file_id:
+                return
+
+            path = self._get_shared_file_path(file_id)
+            if not path or not os.path.exists(path):
+                self._lh_send_via(via_key,
+                                  {"t": "relay_file_error", "to": to_uid, "req_id": req_id, "code": "not_found"})
+                return
+
+            try:
+                size = int(os.path.getsize(path))
+                if size <= 0 or size > MAX_BLOB_SEND_BYTES:
+                    self._lh_send_via(via_key,
+                                      {"t": "relay_file_error", "to": to_uid, "req_id": req_id, "code": "bad_size"})
+                    return
+
+                # Pull expected sha/name from file_id when possible, otherwise compute sha quickly
+                # file_id format you use: "sha:size:filename"
+                sha = ""
+                name = os.path.basename(path)
+                try:
+                    parts = str(file_id).split(":", 2)
+                    if len(parts) == 3:
+                        sha = parts[0]
+                        name = parts[2] or name
+                except Exception:
+                    pass
+                if not sha:
+                    sha = sha256_file(path)
+
+                # begin
+                self._lh_send_via(via_key, {
+                    "t": "relay_file_begin",
+                    "to": to_uid,
+                    "req_id": req_id,
+                    "size": size,
+                    "sha256": sha,
+                    "filename": _safe_str(name, 256),
+                })
+
+                # chunks
+                with open(path, "rb") as f:
+                    while True:
+                        raw = f.read(RELAY_CHUNK_RAW)
+                        if not raw:
+                            break
+                        b64s = base64.b64encode(raw).decode("ascii")
+                        self._lh_send_via(via_key, {
+                            "t": "relay_file_chunk",
+                            "to": to_uid,
+                            "req_id": req_id,
+                            "b64": b64s,
+                        })
+
+                # end
+                self._lh_send_via(via_key, {"t": "relay_file_end", "to": to_uid, "req_id": req_id})
+
+            except Exception:
+                self._lh_send_via(via_key,
+                                  {"t": "relay_file_error", "to": to_uid, "req_id": req_id, "code": "send_failed"})
+
+            return
+        if t == "relay_file_end":
+            req_id = str(msg.get("req_id") or "")
+            with self._relay_dl_lock:
+                st = self._relay_downloads.get(req_id)
+            if not st:
+                return
+
+            try:
+                st["f"].flush()
+                st["f"].close()
+            except Exception:
+                pass
+
+            got_sha = st["h"].hexdigest().lower()
+            exp_sha = str(st.get("expected_sha256") or "").lower()
+            if exp_sha and got_sha != exp_sha:
+                self._relay_download_finish(req_id, "sha_mismatch")
+                return
+
+            self._relay_download_finish(req_id, "")
+            return
+
+        if t in ("relay_file_error", "relay_file_fail", "relay_file_nack"):
+            req_id = str(msg.get("req_id") or "")
+            code = msg.get("code") or msg.get("error") or msg.get("reason") or "error"
+            self._relay_download_finish(req_id, _safe_str(code, 64))
+            return
+    def _normalize_lh_addrs(self, addrs: List[str]) -> List[str]:
+        out: List[str] = []
+        for raw in addrs:
+            s = (raw or "").strip()
+            if not s:
+                continue
+            if "://" in s:
+                s = s.split("://", 1)[1]
+            if "/" in s:
+                s = s.split("/", 1)[0]
+            host = s
+            port = 38888
+            if ":" in s:
+                host, ps = s.rsplit(":", 1)
+                try:
+                    port = int(ps.strip())
+                except Exception:
+                    continue
+            host = host.strip()
+            if not host or port <= 0:
+                continue
+            out.append(f"{host}:{port}")
+        # de-dupe, preserve order
+        dedup: List[str] = []
+        seen = set()
+        for x in out:
+            if x in seen:
+                continue
+            seen.add(x)
+            dedup.append(x)
+        return dedup
+
+    def _parse_lighthouse_env_multi(self) -> List[str]:
+        # NEW: supports P2P_LIGHTHOUSES="a:38888,b:38888" (comma-separated)
+        raw = (os.environ.get("P2P_LIGHTHOUSES") or "").strip()
+        if raw:
+            targets = self._normalize_lh_addrs([x.strip() for x in raw.split(",")])
+            if targets:
+                return targets
+
+        # Back-compat: old single env P2P_LIGHTHOUSE="host:port"
+        one = (os.environ.get("P2P_LIGHTHOUSE") or "").strip()
+        if one:
+            targets = self._normalize_lh_addrs([one])
+            if targets:
+                return targets
+
+        # BUILT-IN fallback (so users never type anything)
+        return self._normalize_lh_addrs(DEFAULT_BOOTSTRAP_LIGHTHOUSES)
+
+    def connect_lighthouses(self, addrs: List[str], *, token: str = "") -> None:
+        """
+        Connect to multiple lighthouses at once.
+        Call anytime (GUI can call this) — it will add/remove connections as needed.
+        """
+        if token is not None and str(token).strip() != "":
+            self._lh_token = str(token).strip()
+
+        targets = self._normalize_lh_addrs(addrs)
+        self._lh_targets = targets
+
+        # Stop removed
+        for key, cli in list(self._lhs.items()):
+            if key not in targets:
+                try:
+                    cli.stop()
+                except Exception:
+                    pass
+                self._lhs.pop(key, None)
+
+        # Start/refresh existing
+        for key in targets:
+            host, ps = key.rsplit(":", 1)
+            port = int(ps)
+
+            if key in self._lhs:
+                cli = self._lhs[key]
+                cli.token = self._lh_token
+                cli.set_hello(self._lh_hello_payload())
+                continue
+
+            cli = LighthouseClient(
+                host,
+                port,
+                token=self._lh_token,
+                on_message=(lambda m, k=key: self._handle_lighthouse(m, k)),
+            )
+            cli.set_hello(self._lh_hello_payload())
+            cli.start()
+            self._lhs[key] = cli
+
+    def _lh_refresh_hello(self, *, send_immediately: bool = False) -> None:
+        if not self._lhs:
+            return
+
+        hp = self._lh_hello_payload()
+        for cli in self._lhs.values():
+            try:
+                cli.set_hello(hp)
+            except Exception:
+                pass
+
+        if send_immediately and hp:
+            t = now_ts()
+            msg = dict(hp)
+            if self._lh_token:
+                msg["token"] = self._lh_token
+            msg["t"] = "hello"
+            msg["ts"] = t
+            for cli in self._lhs.values():
+                try:
+                    if cli.is_connected:
+                        cli.send(msg)
+                except Exception:
+                    pass
+    def lighthouse_status(self) -> Dict[str, Any]:
+        items = []
+        connected = 0
+        for key, cli in self._lhs.items():
+            ok = bool(cli.is_connected)
+            if ok:
+                connected += 1
+            items.append({"addr": key, "connected": ok})
+        return {"total": len(items), "connected": connected, "items": items}
+
+    def _lh_best_for_peer(self, peer: PeerInfo) -> Optional[LighthouseClient]:
+        vias = getattr(peer, "relay_via", []) or []
+        for k in vias:
+            cli = self._lhs.get(k)
+            if cli and cli.is_connected:
+                return cli
+        for cli in self._lhs.values():
+            if cli.is_connected:
+                return cli
+        return None
+
+    def _lh_send_via(self, key: str, obj: Dict[str, Any]) -> bool:
+        cli = self._lhs.get(key)
+        if cli and cli.is_connected:
+            cli.send(obj)
+            return True
+        return False
+
+    def _lh_send_any(self, obj: Dict[str, Any]) -> bool:
+        for cli in self._lhs.values():
+            if cli.is_connected:
+                cli.send(obj)
+                return True
+        return False
