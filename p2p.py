@@ -1387,9 +1387,18 @@ class P2PService:
             tcp_port=0,
             room=str(peer.get("room") or "general"),
             avatar_sha=str(peer.get("avatar_sha") or ""),
-            last_seen=float(peer.get("last_seen") or now_ts()),
+
+            # --- DELETE THIS LINE ---
+            # last_seen=float(peer.get("last_seen") or now_ts()),
+
+            # --- REPLACE WITH THIS ---
+            # Use our OWN clock. If the server just sent us this peer,
+            # they are alive right now. Ignore server clock skew.
+            last_seen=now_ts(),
+            # -------------------------
+
             wallet_addr=str(peer.get("wallet_addr") or ""),
-            relay_via=[via_key],  # NEW
+            relay_via=[via_key],
         )
         if not p.user_id or p.user_id == self.identity.user_id:
             return

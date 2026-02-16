@@ -223,26 +223,35 @@ class LighthouseState:
                 self.remove(uid)
 
     def broadcast_room(self, room: str, obj: Dict[str, Any], *, exclude_user_id: str = "") -> None:
-        room = _safe_str(room or "general", 64)
+        # Normalize room names to ensure matches
+        room = _safe_str(room or "general", 64).lower()
         ex = _safe_str(exclude_user_id or "", 128)
 
+        # 1. Gather targets safely under lock
+        targets: List["ClientSession"] = []
         with self.lock:
-            targets: List["ClientSession"] = []
-            for uid, sess in self.clients.items():
+            # Create a snapshot of items to iterate safely
+            for uid, sess in list(self.clients.items()):
                 if ex and uid == ex:
                     continue
+
                 rec = self.peers.get(uid)
-                if rec and rec.room == room:
+                # CRITICAL FIX: Ensure we compare lower() to lower()
+                if rec and rec.room.lower() == room:
                     targets.append(sess)
 
+        # 2. Send to targets (outside lock to prevent deadlocks)
         for sess in targets:
             try:
                 sess.send(obj)
             except Exception:
+                # If a client is dead, close it and clean up
                 try:
                     sess.close()
                 except Exception:
                     pass
+                if sess.user_id:
+                    self.remove(sess.user_id)
 
 
 STATE = LighthouseState()
