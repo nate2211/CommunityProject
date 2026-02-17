@@ -186,8 +186,14 @@ class LighthouseState:
         room_map: Dict[str, List[Dict[str, Any]]] = {}
         uid_to_room: Dict[str, str] = {}
         for rec in peers_snapshot:
-            uid_to_room[rec.user_id] = rec.room
-            room_map.setdefault(rec.room, []).append(asdict(rec))
+            # Normalize to lower case for grouping keys
+            room_key = rec.room.strip().lower()
+            uid_to_room[rec.user_id] = room_key
+
+            p_dict = asdict(rec)
+            # We don't need to send relay_via internal field to clients usually,
+            # but it doesn't hurt.
+            room_map.setdefault(room_key, []).append(p_dict)
 
         # Safe: list_lighthouses() uses the lock internally
         lighthouses = self.list_lighthouses()
