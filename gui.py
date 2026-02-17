@@ -310,12 +310,7 @@ class MainWindow(QMainWindow):
                 avatar_path=avatar_path,
                 wallet_addr=wallet_addr,
             )
-            STATE.p2p.set_identity(
-                user_id=self._my_user_id,
-                name=self._my_name,
-                avatar_path=avatar_path,
-                wallet_addr=wallet_addr,
-            )
+
 
             # Match current room
             STATE.p2p.set_room("general")
@@ -1016,7 +1011,7 @@ class MainWindow(QMainWindow):
 
         label = f"{from_disp} → {to_disp}"
 
-        if t == "tx":
+        if t in ("tx", "tx_push"):
             confirmed = bool(m.get("confirmed") or m.get("ledger_synced"))
             status = "✅ CONFIRMED" if confirmed else "⏳ PENDING"
 
@@ -1506,15 +1501,38 @@ class MainWindow(QMainWindow):
     def _save_profile(self) -> None:
         name = (self.name_edit.text() or "anon").strip()[:64]
         avatar_path = getattr(self, "_pending_avatar", "")
+
         try:
             run_block("account", "", {"action": "set", "name": name, "avatar_path": avatar_path})
             self._pending_avatar = ""
             self._refresh_profile_ui()
-            # presence may include avatar/wallet info; refresh it
+
+            # ✅ IMPORTANT: update the LIVE P2P identity, not just account.json
+            me = load_account()
+            self._my_user_id = str(me.get("user_id", "") or "")
+            self._my_name = str(me.get("name", "anon") or "anon")
+
+            wallet_addr = ""
+            try:
+                wallet_addr = run_block("wallet", "", {"action": "address"}).get("address", "")
+            except Exception:
+                wallet_addr = str(getattr(STATE.wallet, "address", "") or "")
+
+            try:
+                STATE.p2p.set_identity(
+                    user_id=self._my_user_id,
+                    name=self._my_name,
+                    avatar_path=str(me.get("avatar_path", "") or ""),
+                    wallet_addr=wallet_addr,
+                )
+            except Exception:
+                pass
+
             try:
                 STATE.p2p.broadcast_presence()
             except Exception:
                 pass
+
         except Exception as e:
             QMessageBox.warning(self, "Save failed", str(e))
 

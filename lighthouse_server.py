@@ -79,8 +79,10 @@ def _send_json(conn: socket.socket, obj: Dict[str, Any]) -> None:
     data = (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
     if len(data) > MAX_LINE:
         return
-    conn.sendall(data)
-
+    try:
+        conn.sendall(data)
+    except OSError:
+        return
 
 @dataclass
 class PeerRecord:
@@ -112,9 +114,14 @@ class LighthouseState:
 
     def upsert_peer(self, rec: PeerRecord, sess: "ClientSession") -> None:
         with self.lock:
+            old = self.clients.get(rec.user_id)
+            if old is not None and old is not sess:
+                try:
+                    old.close()
+                except Exception:
+                    pass
             self.clients[rec.user_id] = sess
             self.peers[rec.user_id] = rec
-
     def upsert_lighthouse(self, ip: str, port: int, user_id: str, ts: float) -> None:
         ip = _safe_str(ip, 128)
         port = _safe_int(port, 0, 65535, 0)
@@ -135,8 +142,11 @@ class LighthouseState:
                     continue
                 out.append({"ip": rec.ip, "port": int(rec.port), "user_id": rec.user_id})
         return out
-    def remove(self, user_id: str) -> None:
+    def remove(self, user_id: str, expected_sess: Optional["ClientSession"] = None) -> None:
         with self.lock:
+            cur = self.clients.get(user_id)
+            if expected_sess is not None and cur is not expected_sess:
+                return
             self.clients.pop(user_id, None)
             self.peers.pop(user_id, None)
 
@@ -164,73 +174,85 @@ class LighthouseState:
                     sess.close()
                 except Exception:
                     pass
-            self.remove(uid)
+            self.remove(uid, expected_sess=sess)
 
     def broadcast_peer_lists(self) -> None:
         """
-        IMPORTANT:
-        - Don't hold STATE.lock while doing socket I/O.
-        - Avoid calling list_lighthouses() while holding a non-reentrant lock.
+        Generates and sends peer lists to all connected clients.
         """
         t = now_ts()
 
+        # 1. Snapshot state safely
         with self.lock:
             if (t - self._last_peerlist_bcast) < PEERLIST_INTERVAL_S:
                 return
             self._last_peerlist_bcast = t
 
             peers_snapshot = list(self.peers.values())
-            clients_snapshot = list(self.clients.items())  # (uid, session)
+            clients_snapshot = list(self.clients.items())
 
-        # Build room -> list[dict] outside the lock
-        room_map: Dict[str, List[Dict[str, Any]]] = {}
-        uid_to_room: Dict[str, str] = {}
-        for rec in peers_snapshot:
-            # Normalize to lower case for grouping keys
-            room_key = rec.room.strip().lower()
-            uid_to_room[rec.user_id] = room_key
-
-            p_dict = asdict(rec)
-            # We don't need to send relay_via internal field to clients usually,
-            # but it doesn't hurt.
-            room_map.setdefault(room_key, []).append(p_dict)
-
-        # Safe: list_lighthouses() uses the lock internally
         lighthouses = self.list_lighthouses()
 
+        # 2. Group peers by NORMALIZED room (lowercase)
+        #    This allows "General" and "general" to see each other.
+        room_map: Dict[str, List[Dict[str, Any]]] = {}
+        uid_to_room_key: Dict[str, str] = {}
+
+        for rec in peers_snapshot:
+            key = rec.room.strip().lower()
+            uid_to_room_key[rec.user_id] = key
+
+            # Any peer coming from lighthouse MUST be relay-only.
+            # LAN peers are discovered separately via multicast.
+            p_dict = asdict(rec)
+            p_dict["ip"] = "relay"
+            p_dict["tcp_port"] = 0
+
+            room_map.setdefault(key, []).append(p_dict)
+
+        # 3. Build payloads
         sends: List[Tuple[str, "ClientSession", Dict[str, Any]]] = []
+
         for uid, sess in clients_snapshot:
-            room = uid_to_room.get(uid)
-            if not room:
+            # Find which normalized room this user is in
+            my_key = uid_to_room_key.get(uid)
+            if not my_key:
                 continue
 
-            peers = [p for p in room_map.get(room, []) if str(p.get("user_id")) != uid]
+            # Get all peers in that normalized room
+            potential_peers = room_map.get(my_key, [])
+
+            # Filter out the user themselves
+            others = [p for p in potential_peers if str(p.get("user_id")) != uid]
+
+            # Use the session's raw room name if available so the UI doesn't flicker
+            # fallback to the normalized key if not set
+            ui_room_name = getattr(sess, "current_room_raw", my_key)
 
             sends.append((
                 uid,
                 sess,
                 {
                     "t": "peer_list",
+                    "v": 1,
                     "ts": t,
-                    "room": room,
-                    "peers": peers,
+                    "room": ui_room_name,  # Send back the name they used
+                    "peers": others,
                     "lighthouses": lighthouses,
                 },
             ))
 
+        # 4. Send
         for uid, sess, payload in sends:
             try:
                 sess.send(payload)
             except Exception:
-                try:
-                    sess.close()
-                except Exception:
-                    pass
-                self.remove(uid)
+                sess.close()
+                self.remove(uid, expected_sess=sess)
 
     def broadcast_room(self, room: str, obj: Dict[str, Any], *, exclude_user_id: str = "") -> None:
         # Normalize room names to ensure matches
-        room = _safe_str(room or "general", 64).lower()
+        room = _safe_str(room or "general", 64).strip().lower()
         ex = _safe_str(exclude_user_id or "", 128)
 
         # 1. Gather targets safely under lock
@@ -243,7 +265,7 @@ class LighthouseState:
 
                 rec = self.peers.get(uid)
                 # CRITICAL FIX: Ensure we compare lower() to lower()
-                if rec and rec.room.lower() == room:
+                if rec and rec.room.strip().lower() == room:
                     targets.append(sess)
 
         # 2. Send to targets (outside lock to prevent deadlocks)
@@ -257,7 +279,7 @@ class LighthouseState:
                 except Exception:
                     pass
                 if sess.user_id:
-                    self.remove(sess.user_id)
+                    self.remove(sess.user_id, expected_sess=sess)
 
 
 STATE = LighthouseState()
@@ -274,9 +296,13 @@ class ClientSession(threading.Thread):
         self._send_lock = threading.Lock()
         self._closed = threading.Event()
 
+        # keep raw room name for UI stability
+        self.current_room_raw: str = "general"
+
         # relay file in-flight accounting (req_id -> bytes_forwarded)
         self._file_bytes: Dict[str, int] = {}
-
+        self._lh_port: int = 0
+        self._is_lh: bool = False
     def close(self) -> None:
         self._closed.set()
         try:
@@ -286,7 +312,10 @@ class ClientSession(threading.Thread):
 
     def send(self, obj: Dict[str, Any]) -> None:
         with self._send_lock:
-            _send_json(self.conn, obj)
+            try:
+                _send_json(self.conn, obj)
+            except Exception:
+                self.close()
 
     def run(self) -> None:
         try:
@@ -315,22 +344,29 @@ class ClientSession(threading.Thread):
                         return
 
                     self.user_id = uid
+                    # Normalize user-visible fields early
+                    name = _safe_str(msg.get("name") or "unknown", 64).strip() or "unknown"
+                    room = _safe_str(msg.get("room") or "general", 64).strip() or "general"
+
                     rec = PeerRecord(
                         user_id=uid,
-                        name=_safe_str(msg.get("name") or "unknown", 64),
-                        room=_safe_str(msg.get("room") or "general", 64),
+                        name=name,
+                        room=room,  # keep raw (but stripped) for UI
                         avatar_sha=_safe_str(msg.get("avatar_sha") or "", 128),
                         wallet_addr=_safe_str(msg.get("wallet_addr") or "", 128),
                         last_seen=now_ts(),
                         ip=self.addr[0],
                         tcp_port=_safe_int(msg.get("tcp_port"), 0, 65535, 0),
                     )
+                    self.current_room_raw = rec.room
                     STATE.upsert_peer(rec, self)
                     # --- NEW: if this client is advertising itself as a lighthouse, record its PUBLIC endpoint ---
                     lh_port = _safe_int(msg.get("lighthouse_port") or msg.get("lh_port") or 0, 0, 65535, 0)
                     is_lh = bool(msg.get("is_lighthouse")) or (
                                 _safe_str(msg.get("role") or "", 32).lower() == "lighthouse")
                     if (is_lh or lh_port > 0) and lh_port > 0:
+                        self._lh_port = lh_port
+                        self._is_lh = True
                         # addr[0] is the public IP as seen by this server (NAT external IP)
                         STATE.upsert_lighthouse(self.addr[0], lh_port, uid, now_ts())
                     continue
@@ -354,11 +390,11 @@ class ClientSession(threading.Thread):
 
                     room = rec.room
                     inner2 = dict(inner)
-                    inner2["v"] = 1
-                    inner2["room"] = room
-                    inner2["from_user_id"] = self.user_id
-                    inner2["from_name"] = rec.name
-                    inner2["avatar_sha"] = rec.avatar_sha
+                    inner2.setdefault("v", 1)
+                    inner2.setdefault("room", room)
+                    inner2.setdefault("from_user_id", self.user_id)
+                    inner2.setdefault("from_name", rec.name)
+                    inner2.setdefault("avatar_sha", rec.avatar_sha)
 
                     mid = _safe_str(inner2.get("msg_id") or "", 128)
                     if not mid:
@@ -382,12 +418,18 @@ class ClientSession(threading.Thread):
                     continue
 
                 if t == "ping":
-                    if self.user_id and self.user_id in STATE.peers:
+                    if self.user_id:
+                        ts = now_ts()
                         with STATE.lock:
-                            STATE.peers[self.user_id].last_seen = now_ts()
+                            rec = STATE.peers.get(self.user_id)
+                            if rec:
+                                rec.last_seen = ts
+                        if self._is_lh and self._lh_port > 0:
+                            STATE.upsert_lighthouse(self.addr[0], self._lh_port, self.user_id, ts)
                     continue
-
                 if t == "relay":
+                    if not self.user_id:
+                        continue
                     to_uid = _safe_str(msg.get("to") or "", 128)
                     kind = _safe_str(msg.get("kind") or "", 32)
                     payload = msg.get("msg")
@@ -399,10 +441,12 @@ class ClientSession(threading.Thread):
                         self.send({"t": "relay_nack", "to": to_uid, "kind": kind, "code": "offline"})
                         continue
 
-                    dst.send({"t": "relay", "kind": kind, "from": self.user_id, "msg": payload, "ts": now_ts()})
+                    dst.send({"t": "relay", "kind": kind, "from": self.user_id, "to": to_uid, "msg": payload, "ts": now_ts()})
                     continue
 
                 if t == "relay_file_get":
+                    if not self.user_id:
+                        continue
                     to_uid = _safe_str(msg.get("to") or "", 128)        # sender user_id
                     req_id = _safe_str(msg.get("req_id") or "", 64)
                     file_id = _safe_str(msg.get("file_id") or "", 1024)
@@ -419,6 +463,8 @@ class ClientSession(threading.Thread):
 
                 if t in (
                 "relay_file_begin", "relay_file_chunk", "relay_file_end", "relay_file_fail", "relay_file_error"):
+                    if not self.user_id:
+                        continue
                     to_uid = _safe_str(msg.get("to") or "", 128)
                     req_id = _safe_str(msg.get("req_id") or "", 64)
                     if not to_uid or not req_id:
@@ -463,28 +509,21 @@ class ClientSession(threading.Thread):
                         fwd.setdefault("code", _safe_str(msg.get("code") or msg.get("reason") or "fail", 64))
 
                     fwd["from"] = self.user_id
-                    dst.send(fwd)
+                    try:
+                        dst.send(fwd)
+                    except Exception:
+                        try:
+                            dst.close()
+                        except Exception:
+                            pass
                     continue
 
-                    if t in ("relay_file_end", "relay_file_fail"):
-                        self._file_bytes.pop(req_id, None)
-
-                    fwd = dict(msg)
-                    # Normalize older names so receivers always get relay_file_error
-                    if t in ("relay_file_fail",):
-                        msg = dict(msg)
-                        msg["t"] = "relay_file_error"
-                        if "code" not in msg:
-                            msg["code"] = _safe_str(msg.get("code") or msg.get("reason") or "fail", 64)
-                    fwd["from"] = self.user_id
-                    dst.send(fwd)
-                    continue
 
         except Exception:
             pass
         finally:
             if self.user_id:
-                STATE.remove(self.user_id)
+                STATE.remove(self.user_id, expected_sess=self)
             try:
                 self.conn.close()
             except Exception:

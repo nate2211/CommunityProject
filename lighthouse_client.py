@@ -36,7 +36,7 @@ class LighthouseClient(threading.Thread):
         self.token = token
         self.on_message = on_message
 
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()
         self._sock: Optional[socket.socket] = None
         self._buf = bytearray()
         self._send_lock = threading.Lock()
@@ -47,7 +47,7 @@ class LighthouseClient(threading.Thread):
         self._last_ping_ts = 0.0
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
         try:
             if self._sock:
                 self._sock.close()
@@ -116,7 +116,7 @@ class LighthouseClient(threading.Thread):
                 line = bytes(self._buf[:nl])
                 del self._buf[: nl + 1]
                 if not line:
-                    return None
+                    return {}
                 if len(line) > MAX_LINE:
                     return None
                 try:
@@ -131,7 +131,7 @@ class LighthouseClient(threading.Thread):
             try:
                 chunk = s.recv(4096)
             except socket.timeout:
-                return None
+                return {}
             except OSError:
                 return None
             if not chunk:
@@ -140,7 +140,7 @@ class LighthouseClient(threading.Thread):
 
     def run(self) -> None:
         backoff = 0.25
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             s = self._connect()
             if not s:
                 time.sleep(backoff)
@@ -163,7 +163,7 @@ class LighthouseClient(threading.Thread):
                 self._last_hello_ts = now_ts()
 
             try:
-                while not self._stop.is_set():
+                while not self._stop_evt.is_set():
                     # ping every ~8s
                     t = now_ts()
                     if (t - self._last_ping_ts) > 8.0:
@@ -182,6 +182,8 @@ class LighthouseClient(threading.Thread):
 
                     msg = self._recv_line(s)
                     if msg is None:
+                        break
+                    if msg == {}:
                         continue
                     self.on_message(msg)
 

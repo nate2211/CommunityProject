@@ -27,6 +27,7 @@ import struct
 import threading
 import time
 import base64
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -38,7 +39,8 @@ from lighthouse_client import LighthouseClient
 
 # Relay file chunk sizing (raw bytes -> base64 <= lighthouse MAX_CHUNK_B64)
 RELAY_CHUNK_RAW = 120_000  # ~160k base64 chars
-
+# LAN->Lighthouse bridge relay (DM / TX / offers) message type size cap
+MAX_BRIDGE_RELAY_BYTES = 120_000
 # Auto-discovered lighthouse sharing
 MAX_AUTO_LIGHTHOUSES = 5
 AUTO_CONNECT_DISCOVERED_LIGHTHOUSES = True  # set False if you only want to store, not connect
@@ -221,6 +223,8 @@ def tcp_request_blob(ip: str, port: int, req: Dict[str, Any], save_path: str, ex
 
 
 # ---------------- Data Models ----------------
+
+
 @dataclass
 class PeerInfo:
     user_id: str
@@ -233,6 +237,8 @@ class PeerInfo:
     wallet_addr: str = ""
     relay_via: List[str] = field(default_factory=list)
 
+    # True if this peer can forward LAN->Lighthouse (they have a lighthouse connection)
+    lh_bridge: bool = False
 class PeerDirectory:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -243,7 +249,8 @@ class PeerDirectory:
             return
         if p.tcp_port < 0 or p.tcp_port > 65535:
             return
-        # allow relay-only peers to have tcp_port=0
+
+        # allow relay-only peers
         if p.tcp_port == 0 and p.ip != "relay":
             return
 
@@ -257,9 +264,13 @@ class PeerDirectory:
             if old:
                 old_via = set(getattr(old, "relay_via", []) or [])
                 new_via = set(getattr(p, "relay_via", []) or [])
-                merged_via = sorted(old_via | new_via)
-
-                if old.ip != "relay" and p.ip == "relay":
+                p.relay_via = sorted(old_via | new_via)
+                try:
+                    p.lh_bridge = bool(getattr(old, "lh_bridge", False)) or bool(getattr(p, "lh_bridge", False))
+                except Exception:
+                    pass
+                # ONLY upgrade relay → direct if we actually have LAN presence
+                if old.ip != "relay" and old.tcp_port > 0 and p.ip == "relay":
                     p.ip = old.ip
                     p.tcp_port = old.tcp_port
 
@@ -271,8 +282,6 @@ class PeerDirectory:
                     p.wallet_addr = old.wallet_addr
                 if not p.name or p.name == "unknown":
                     p.name = old.name
-
-                p.relay_via = merged_via
 
             self._peers[p.user_id] = p
 
@@ -316,15 +325,16 @@ class FileOffer:
 # ---------------- TCP Server ----------------
 class TcpServer(threading.Thread):
     def __init__(
-        self,
-        host: str,
-        port: int,
-        *,
-        on_dm: Callable[[Dict[str, Any], Tuple[str, int]], None],
-        on_dm_file_offer: Callable[[Dict[str, Any], Tuple[str, int]], None],
-        on_tx_push: Callable[[Dict[str, Any], Tuple[str, int]], None],
-        get_file_path: Callable[[str], Optional[str]],
-        get_avatar_path: Callable[[], Optional[str]],
+            self,
+            host: str,
+            port: int,
+            *,
+            on_dm: Callable[[Dict[str, Any], Tuple[str, int]], None],
+            on_dm_file_offer: Callable[[Dict[str, Any], Tuple[str, int]], None],
+            on_tx_push: Callable[[Dict[str, Any], Tuple[str, int]], None],
+            on_bridge_relay: Callable[[Dict[str, Any], Tuple[str, int]], None],
+            get_file_path: Callable[[str], Optional[str]],
+            get_avatar_path: Callable[[], Optional[str]],
     ) -> None:
         super().__init__(daemon=True)
         self.host = host
@@ -332,14 +342,15 @@ class TcpServer(threading.Thread):
         self.on_dm = on_dm
         self.on_dm_file_offer = on_dm_file_offer
         self.on_tx_push = on_tx_push
+        self.on_bridge_relay = on_bridge_relay
         self.get_file_path = get_file_path
         self.get_avatar_path = get_avatar_path
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()
         self.bound_port: Optional[int] = None
         self._sock: Optional[socket.socket] = None
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
         try:
             if self._sock:
                 self._sock.close()
@@ -387,7 +398,7 @@ class TcpServer(threading.Thread):
         self._sock = srv
         self.bound_port = int(srv.getsockname()[1])
 
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             try:
                 conn, addr = srv.accept()
             except socket.timeout:
@@ -431,7 +442,10 @@ class TcpServer(threading.Thread):
                     self._send_blob_path(conn, ap or "")
                     conn.close()
                     continue
-
+                if t == "bridge_relay":
+                    self.on_bridge_relay(msg, addr)
+                    conn.close()
+                    continue
                 conn.close()
             except Exception:
                 try:
@@ -448,11 +462,11 @@ class UdpListener(threading.Thread):
         self.port = int(port)
         self.ttl = int(ttl)
         self.on_message = on_message
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()
         self._sock: Optional[socket.socket] = None
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
         try:
             if self._sock:
                 self._sock.close()
@@ -463,7 +477,7 @@ class UdpListener(threading.Thread):
         s = mcast_socket(self.group, self.port, self.ttl)
         s.settimeout(0.5)
         self._sock = s
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             try:
                 raw, addr = s.recvfrom(65535)
             except socket.timeout:
@@ -525,6 +539,14 @@ class P2PService:
         self._lh_token: str = (os.environ.get("P2P_LIGHTHOUSE_TOKEN") or "").strip()
         self._lhs: Dict[str, LighthouseClient] = {}  # key "host:port" -> client
         self._lh_targets: List[str] = []  # normalized ["host:port", ...]
+
+        # When we learn peers from a lighthouse, rebroadcast them on LAN so
+        # other local instances (not connected to lighthouse) still see them.
+        self._lh_relay_rebroadcast_lock = threading.Lock()
+        self._lh_relay_rebroadcast_seen: Dict[str, float] = {}   # key -> last_ts
+        self._lh_relay_rebroadcast_min_s: float = 10.0           # debounce per peer
+        self._lh_relay_rebroadcast_keep_s: float = 120.0         # prune window
+
         # downloads in-flight via relay: req_id -> state
         self._relay_dl_lock = threading.Lock()
         self._relay_downloads: Dict[str, Dict[str, Any]] = {}
@@ -532,6 +554,12 @@ class P2PService:
         self._seen_room_ids: Dict[str, float] = {}
         self._seen_room_keep_s: float = 90.0
         self._seen_room_max: int = 4096
+
+        # ---- Bridge dedupe (LAN<->Lighthouse forwarding) ----
+        self._bridge_seen: Dict[str, float] = {}
+        self._bridge_keep_s: float = 120.0
+        self._bridge_lock = threading.Lock()
+
         # discovered lighthouses (addr strings like "ip:port")
         self._known_lighthouses_lock = threading.Lock()
         self.known_lighthouses: set[str] = set(self._normalize_lh_addrs(DEFAULT_BOOTSTRAP_LIGHTHOUSES))
@@ -544,6 +572,7 @@ class P2PService:
                 on_dm=self._handle_dm,
                 on_dm_file_offer=self._handle_dm_file_offer_tcp,
                 on_tx_push=self._handle_tx_push_tcp,
+                on_bridge_relay=self._handle_bridge_relay_tcp,
                 get_file_path=self._get_shared_file_path,
                 get_avatar_path=self._get_avatar_path,
             )
@@ -582,7 +611,7 @@ class P2PService:
         self._lh_refresh_hello(send_immediately=True)
 
     def set_room(self, room: str) -> None:
-        self.room = (_safe_str(room, 64) or "general")
+        self.room = (_safe_str(room, 64).strip() or "general")
         self._lh_refresh_hello(send_immediately=True)
     def avatar_sha(self) -> str:
         ap = self.identity.avatar_path
@@ -593,13 +622,34 @@ class P2PService:
                 return ""
         return ""
 
+    def _bridge_mark_once(self, key: str) -> bool:
+        """
+        Returns True if this is the first time we see this bridge-key recently.
+        Used to prevent multiple bridge nodes from re-forwarding the same msg_id.
+        """
+        try:
+            now = now_ts()
+            with self._bridge_lock:
+                last = self._bridge_seen.get(key)
+                if last is not None and (now - float(last)) <= float(self._bridge_keep_s):
+                    return False
+
+                # prune
+                if len(self._bridge_seen) > 4096:
+                    cutoff = now - float(self._bridge_keep_s)
+                    self._bridge_seen = {k: v for k, v in self._bridge_seen.items() if float(v) >= cutoff}
+
+                self._bridge_seen[key] = now
+                return True
+        except Exception:
+            return True
 
     def broadcast_presence(self) -> None:
         t = now_ts()
         if (t - self._last_presence_ts) < float(self.presence_min_interval_s):
             return
         self._last_presence_ts = t
-
+        can_bridge = bool(self._lhs) and any(cli.is_connected for cli in self._lhs.values())
         # multicast presence (LAN only)
         if not DISABLE_MCAST:
             msg = {
@@ -612,6 +662,7 @@ class P2PService:
                 "tcp_port": self.tcp_port,
                 "avatar_sha": self.avatar_sha(),
                 "wallet_addr": self.identity.wallet_addr,
+                "lh_bridge": bool(can_bridge),
             }
             mcast_send(self.group, self.port, self.ttl, msg)
 
@@ -693,9 +744,12 @@ class P2PService:
         self._lh_room_broadcast(msg)
 
     def send_dm_text(self, peer: PeerInfo, text: str) -> None:
+        ts = now_ts()
+        mid = uuid.uuid4().hex
         obj = {
             "t": "dm",
-            "ts": now_ts(),
+            "ts": ts,
+            "msg_id":mid,
             "from_user_id": self.identity.user_id,
             "from_name": self.identity.name,
             "to_user_id": peer.user_id,  # NEW
@@ -709,19 +763,91 @@ class P2PService:
             cli = self._lh_best_for_peer(peer)
             if cli:
                 cli.send({"t": "relay", "kind": "dm", "to": peer.user_id, "msg": obj})
+                try:
+                    self._q_dm_msgs.put({
+                        "t": "dm",
+                        "ts": ts,
+                        "msg_id": mid,
+                        "from_user_id": self.identity.user_id,
+                        "from_name": self.identity.name,
+                        "to_user_id": peer.user_id,  # NEW
+                        "to_name": peer.name,  # NEW
+                        "avatar_sha": self.avatar_sha(),
+                        "text": _safe_str(text, 4000),
+                        "direction": "out",
+                        "_src_ip": "local"
+                    })
+                except Exception:
+                    pass
                 return
-            raise RuntimeError("no_lighthouse_connected")
+
+            # No direct lighthouse connection: try forwarding via a LAN bridge node
+            bridge = self._pick_lan_bridge()
+            if bridge:
+                tcp_send_json(
+                    bridge.ip,
+                    int(bridge.tcp_port),
+                    {"t": "bridge_relay", "kind": "dm", "to": peer.user_id, "msg": obj},
+                )
+                try:
+                    self._q_dm_msgs.put({
+                        "t": "dm",
+                        "ts": ts,
+                        "msg_id": mid,
+                        "from_user_id": self.identity.user_id,
+                        "from_name": self.identity.name,
+                        "to_user_id": peer.user_id,  # NEW
+                        "to_name": peer.name,  # NEW
+                        "avatar_sha": self.avatar_sha(),
+                        "text": _safe_str(text, 4000),
+                        "direction": "out",
+                        "_src_ip": "local"
+                    })
+                except Exception:
+                    pass
+                return
+
+            raise RuntimeError("no_lighthouse_connected_or_bridge")
 
         # direct LAN path
-        tcp_send_json(peer.ip, peer.tcp_port, obj)
+        try:
+            tcp_send_json(peer.ip, peer.tcp_port, obj)
+            try:
+                self._q_dm_msgs.put({
+                    "t": "dm",
+                    "ts": ts,
+                    "msg_id": mid,
+                    "from_user_id": self.identity.user_id,
+                    "from_name": self.identity.name,
+                    "to_user_id": peer.user_id,  # NEW
+                    "to_name": peer.name,  # NEW
+                    "avatar_sha": self.avatar_sha(),
+                    "text": _safe_str(text, 4000),
+                    "direction": "out",
+                    "_src_ip": "local"
+                })
+            except Exception:
+                pass
+            return
+        except Exception:
+            cli = self._lh_best_for_peer(peer)
+            if cli:
+                cli.send({"t": "relay", "kind": "dm", "to": peer.user_id, "msg": obj})
+                return
+            raise
 
     def push_tx_to_peer(self, peer: PeerInfo, tx_wire: str, *, ledger_tip: Optional[Dict[str, Any]] = None) -> None:
+        ts = now_ts()
+        mid = uuid.uuid4().hex
         obj: Dict[str, Any] = {
             "t": "tx_push",
-            "ts": now_ts(),
+            "ts": ts,
+            "msg_id": mid,
             "from_user_id": self.identity.user_id,
             "from_name": self.identity.name,
-            "from_tcp_port": self.tcp_port,  # lets receiver fetch attachments/ledger from sender
+            "from_tcp_port": self.tcp_port,
+            "to_user_id": peer.user_id,
+            "to_name": peer.name,
             "tx_wire": _safe_str(tx_wire, 120_000),
         }
         if isinstance(ledger_tip, dict) and ledger_tip:
@@ -734,13 +860,55 @@ class P2PService:
                 "height": _clamp_int(ledger_tip.get("height"), 0, 10_000_000, 0),
                 "tip_hash": _safe_str(ledger_tip.get("tip_hash") or "", 128),
             }
+        try:
+            # best-effort decode to produce attachment_offer for UI
+            ao = None
+            try:
+                raw = base64.urlsafe_b64decode(tx_wire.encode("ascii"))
+                d = json.loads(raw.decode("utf-8"))
+                if isinstance(d, dict):
+                    ao = self._attachment_offer_from_tx_dict(
+                        d,
+                        from_uid=self.identity.user_id,
+                        from_name=self.identity.name,
+                        from_ip="local",
+                        from_tcp_port=int(self.tcp_port),
+                        relay_via="",
+                    )
+            except Exception:
+                ao = None
+
+            echo = dict(obj)
+            echo["direction"] = "out"
+            echo["_src_ip"] = "local"
+            if ao:
+                echo["attachment_offer"] = ao
+            self._q_tx_msgs.put(echo)
+        except Exception:
+            pass
         if peer.ip == "relay" or peer.tcp_port <= 0:
             cli = self._lh_best_for_peer(peer)
             if not cli:
-                raise RuntimeError("no_lighthouse_connected")
+                bridge = self._pick_lan_bridge()
+                if bridge:
+                    tcp_send_json(
+                        bridge.ip,
+                        int(bridge.tcp_port),
+                        {"t": "bridge_relay", "kind": "tx_push", "to": peer.user_id, "msg": obj},
+                    )
+                    return
+                raise RuntimeError("no_lighthouse_connected_or_bridge")
             cli.send({"t": "relay", "kind": "tx_push", "to": peer.user_id, "msg": obj})
             return
-        tcp_send_json(peer.ip, peer.tcp_port, obj)
+        try:
+            tcp_send_json(peer.ip, peer.tcp_port, obj)
+            return
+        except Exception:
+            cli = self._lh_best_for_peer(peer)
+            if cli:
+                cli.send({"t": "relay", "kind": "tx_push", "to": peer.user_id, "msg": obj})
+                return
+            raise
 
     def share_file_to_room(self, path: str, note: str = "", scope: str = "room") -> FileOffer:
         path = str(Path(path).resolve())
@@ -840,12 +1008,26 @@ class P2PService:
         if peer.ip == "relay" or peer.tcp_port <= 0:
             cli = self._lh_best_for_peer(peer)
             if not cli:
-                raise RuntimeError("no_lighthouse_connected")
+                bridge = self._pick_lan_bridge()
+                if bridge:
+                    tcp_send_json(
+                        bridge.ip,
+                        int(bridge.tcp_port),
+                        {"t": "bridge_relay", "kind": "dm_file_offer", "to": peer.user_id, "msg": obj},
+                    )
+                    return offer
+                raise RuntimeError("no_lighthouse_connected_or_bridge")
             cli.send({"t": "relay", "kind": "dm_file_offer", "to": peer.user_id, "msg": obj})
             return offer
-
-        tcp_send_json(peer.ip, peer.tcp_port, obj)
-        return offer
+        try:
+            tcp_send_json(peer.ip, peer.tcp_port, obj)
+            return offer
+        except Exception:
+            cli = self._lh_best_for_peer(peer)
+            if cli:
+                cli.send({"t": "relay", "kind": "dm_file_offer", "to": peer.user_id, "msg": obj})
+                return offer
+            raise
 
     def download_offer(self, offer: FileOffer, save_path: str) -> int:
         # --- FIX START: Allow ledger files to bypass moderation ---
@@ -1036,7 +1218,12 @@ class P2PService:
                 "t": "dm",
                 "ts": float(msg.get("ts") or now_ts()),
                 "from_user_id": _safe_str(msg.get("from_user_id") or "", 128),
-                "from_name": _safe_str(msg.get("from_name") or "unknown", 64),
+                "from_name": _safe_str(
+                    (msg.get("from_name") if str(msg.get("from_name") or "").strip().lower() not in (
+                    "server", "lighthouse") else "")
+                    or "unknown",
+                    64
+                ),
                 "to_user_id": to_uid or self.identity.user_id,
                 "to_name": _safe_str(msg.get("to_name") or self.identity.name, 64),
                 "avatar_sha": _safe_str(msg.get("avatar_sha") or "", 128),
@@ -1048,6 +1235,52 @@ class P2PService:
         except Exception:
             pass
 
+    def _attachment_offer_from_tx_dict(
+            self,
+            txd: Dict[str, Any],
+            *,
+            from_uid: str,
+            from_name: str,
+            from_ip: str,
+            from_tcp_port: int,
+            relay_via: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        If tx dict contains an attachment, synthesize a FileOffer-like dict
+        that GUI/private_chat can use to download the attachment via file_get / relay_file_get.
+        """
+        try:
+            att = txd.get("attachment")
+            if not isinstance(att, dict):
+                return None
+
+            fname = _safe_str(att.get("name") or "", 256).strip()
+            size = _clamp_int(att.get("size"), 0, MAX_BLOB_SEND_BYTES, 0)
+            sha = _safe_str(att.get("sha256") or "", 128).strip().lower()
+            if not fname or size <= 0 or not sha:
+                return None
+
+            file_id = f"{sha}:{size}:{fname}"
+            tx_id = _safe_str(txd.get("tx_id") or "", 128)
+            offer_id = sha256_text(f"tx_attach|{tx_id}|{sha}|{size}|{fname}")
+
+            return {
+                "offer_id": offer_id,
+                "scope": "dm",
+                "room": "",
+                "from_user_id": _safe_str(from_uid, 128),
+                "from_name": _safe_str(from_name, 64),
+                "from_ip": _safe_str(from_ip, 64),
+                "from_tcp_port": int(from_tcp_port),
+                "file_id": file_id,
+                "filename": fname,
+                "size": int(size),
+                "sha256": sha,
+                "note": _safe_str(txd.get("memo") or "", 512),
+                "relay_via": _safe_str(relay_via or "", 256),
+            }
+        except Exception:
+            return None
     def _handle_tx_push_tcp(self, msg: Dict[str, Any], addr: Tuple[str, int]) -> None:
         from_uid = _safe_str(msg.get("from_user_id") or "remote", 128)
 
@@ -1071,10 +1304,24 @@ class P2PService:
         msg["from_tcp_port"] = _clamp_int(msg.get("from_tcp_port"), 0, 65535, 0)
         if addr[0] == "relay":
             msg["from_tcp_port"] = 0
-
+        if not str(msg.get("to_user_id") or "").strip():
+            msg["to_user_id"] = self.identity.user_id
+        if not str(msg.get("to_name") or "").strip():
+            msg["to_name"] = self.identity.name
         msg["tx_wire"] = wire
         msg["_src_ip"] = addr[0]
-
+        # NEW: synthesize attachment_offer so GUI can show "Download attachment" link
+        relay_via = _safe_str(msg.get("_relay_via") or "", 256)
+        ao = self._attachment_offer_from_tx_dict(
+            d,
+            from_uid=msg.get("from_user_id") or from_uid,
+            from_name=msg.get("from_name") or "unknown",
+            from_ip=addr[0],
+            from_tcp_port=int(msg.get("from_tcp_port") or 0),
+            relay_via=relay_via,
+        )
+        if isinstance(ao, dict) and ao:
+            msg["attachment_offer"] = ao
         tip = msg.get("ledger_tip")
         if isinstance(tip, dict):
             msg["ledger_tip"] = {
@@ -1138,7 +1385,7 @@ class P2PService:
         t = msg.get("t")
 
         relay_via = _safe_str(msg.get("_relay_via") or "", 256)
-
+        lh_bridge = bool(msg.get("lh_bridge") in (True, 1, "1", "true", "yes", "on"))
         # --- FIX: Deduplication Check ---
         # If we have seen this unique msg_id before (via LAN or another Relay), drop it.
         # Applies to public_chat and room_file_offer.
@@ -1147,21 +1394,30 @@ class P2PService:
                 return
 
         if t == "presence":
+            # Allow a presence packet to explicitly declare relay identity.
+            # This is used when one client rebroadcasts lighthouse peers onto LAN.
+            ip_override = _safe_str(msg.get("ip") or "", 32).lower()
+            ip_final = "relay" if ip_override == "relay" else src_ip
+
             p = PeerInfo(
-                user_id=str(msg.get("user_id") or ""),
-                name=str(msg.get("name") or "unknown"),
-                ip=src_ip,
+                user_id=_safe_str(msg.get("user_id") or "", 128).strip(),
+                name=_safe_str(msg.get("name") or "unknown", 64).strip() or "unknown",
+                ip=ip_final,
                 tcp_port=int(msg.get("tcp_port") or 0),
-                room=str(msg.get("room") or "general"),
-                avatar_sha=str(msg.get("avatar_sha") or ""),
+                room=_safe_str(msg.get("room") or "general", 64).strip() or "general",
+                avatar_sha=_safe_str(msg.get("avatar_sha") or "", 128),
                 last_seen=now_ts(),
-                wallet_addr=str(msg.get("wallet_addr") or ""),
+                wallet_addr=_safe_str(msg.get("wallet_addr") or "", 128),
                 relay_via=[relay_via] if relay_via else [],
+                lh_bridge=lh_bridge,
             )
             if not p.user_id or p.user_id == self.identity.user_id:
                 return
-            if p.tcp_port <= 0 and p.ip != "relay":
+
+            # if relay peer, tcp_port may be 0 (expected)
+            if p.ip != "relay" and p.tcp_port <= 0:
                 return
+
             self.peers.update(p)
             return
 
@@ -1179,20 +1435,25 @@ class P2PService:
             msg["_src_ip"] = src_ip
             msg["_relay_via"] = relay_via
             self._q_room_msgs.put(msg)
+            if src_ip != "relay" and self._lhs:
+                mid = _safe_str(msg.get("msg_id") or "", 128).strip()
+                if mid and self._bridge_mark_once(f"lan2lh|{mid}"):
+                    try:
+                        self._lh_room_broadcast(dict(msg))
+                    except Exception:
+                        pass
             return
 
         if t == "ledger_tip":
             if _safe_str(msg.get("room") or "", 64) != self.room:
                 return
 
-            from_uid = _safe_str(msg.get("from_user_id") or "", 128)
-            # Don't listen to ourselves
+            from_uid = _safe_str(msg.get("from_user_id") or "", 128).strip()
             if not from_uid or from_uid == self.identity.user_id:
                 return
 
-            # ... (keep existing validation checks) ...
+            # (keep your existing validation here)
 
-            # FIX STARTS HERE: Immediately trigger a sync if the tip is higher than our current height
             current_height = 0
             if hasattr(self, 'get_current_height_func') and self.get_current_height_func:
                 current_height = self.get_current_height_func()
@@ -1205,7 +1466,7 @@ class P2PService:
                     scope="ledger",
                     room=self.room,
                     from_user_id=from_uid,
-                    from_name=_safe_str(msg.get("from_name") or "unknown", 64),
+                    from_name=_safe_str(msg.get("from_name") or "unknown", 64).strip() or "unknown",
                     from_ip=src_ip,
                     from_tcp_port=_clamp_int(msg.get("tcp_port"), 0, 65535, 0),
                     file_id=_safe_str(msg.get("file_id") or "", 1024),
@@ -1216,13 +1477,11 @@ class P2PService:
                     relay_via=relay_via,
                 )
 
-                # ✅ Always queue it so your blocks/GUI can see it
                 try:
                     self._q_ledger_tips.put(dataclasses.asdict(offer))
                 except Exception:
                     pass
 
-                # Optional callback if you wired one
                 cb = getattr(self, "on_ledger_offer", None)
                 if callable(cb):
                     try:
@@ -1230,6 +1489,14 @@ class P2PService:
                     except Exception:
                         pass
 
+            # ✅ ALWAYS bridge LAN -> Lighthouse (even if tip isn't newer for *this* node)
+            if src_ip != "relay" and self._lhs:
+                mid = _safe_str(msg.get("msg_id") or "", 128).strip()
+                if mid and self._bridge_mark_once(f"lan2lh|{mid}"):
+                    try:
+                        self._lh_room_broadcast(dict(msg))
+                    except Exception:
+                        pass
             return
 
         if t == "room_file_offer":
@@ -1273,6 +1540,14 @@ class P2PService:
             if offer.from_tcp_port <= 0 and offer.from_ip != "relay":
                 return
             self._q_room_offers.put(offer)
+            # --- NEW: Bridge LAN -> Lighthouse (so cross-router peers see LAN offers) ---
+            if src_ip != "relay" and self._lhs:
+                mid = _safe_str(msg.get("msg_id") or "", 128).strip()
+                if mid and self._bridge_mark_once(f"lan2lh|{mid}"):
+                    try:
+                        self._lh_room_broadcast(dict(msg))
+                    except Exception:
+                        pass
             return
 
     def register_shared_file(self, file_id: str, path: str) -> None:
@@ -1315,13 +1590,15 @@ class P2PService:
             "height": int(height),
             "tip_hash": _safe_str(tip_hash, 128),
 
+            "msg_id": uuid.uuid4().hex,
+
             "file_id": _safe_str(file_id, 1024),
             "sha256": _safe_str(sha256hex, 128),
             "size": _clamp_int(size, 0, MAX_BLOB_SEND_BYTES, 0),
             "filename": _safe_str(filename, 256),
         }
         mcast_send(self.group, self.port, self.ttl, msg)
-
+        self._lh_room_broadcast(msg)
     def pop_ledger_tips(self, max_n: int = 200) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for _ in range(int(max_n)):
@@ -1380,6 +1657,7 @@ class P2PService:
         self._lh_send_any(obj)
 
     def _relay_peer_upsert(self, peer: Dict[str, Any], via_key: str) -> None:
+        # Peer learned via lighthouse: mark as relay-reachable via via_key
         p = PeerInfo(
             user_id=str(peer.get("user_id") or ""),
             name=str(peer.get("name") or "unknown"),
@@ -1387,22 +1665,57 @@ class P2PService:
             tcp_port=0,
             room=str(peer.get("room") or "general"),
             avatar_sha=str(peer.get("avatar_sha") or ""),
-
-            # --- DELETE THIS LINE ---
-            # last_seen=float(peer.get("last_seen") or now_ts()),
-
-            # --- REPLACE WITH THIS ---
-            # Use our OWN clock. If the server just sent us this peer,
-            # they are alive right now. Ignore server clock skew.
-            last_seen=now_ts(),
-            # -------------------------
-
+            last_seen=now_ts(),  # trust our own clock
             wallet_addr=str(peer.get("wallet_addr") or ""),
             relay_via=[via_key],
         )
+
         if not p.user_id or p.user_id == self.identity.user_id:
             return
+
+        # Update our own directory first
         self.peers.update(p)
+
+        # ---- NEW: Rebroadcast onto LAN so everyone sees this peer ----
+        # This emits a synthetic presence packet with ip="relay" and _relay_via=via_key.
+        # Any local instances on the LAN (even not connected to lighthouse) will learn it.
+        try:
+            if DISABLE_MCAST:
+                return
+
+            now = now_ts()
+            rb_key = f"{via_key}|{p.user_id}"
+
+            with self._lh_relay_rebroadcast_lock:
+                # prune old entries
+                cutoff = now - float(self._lh_relay_rebroadcast_keep_s)
+                if self._lh_relay_rebroadcast_seen:
+                    self._lh_relay_rebroadcast_seen = {
+                        k: ts for k, ts in self._lh_relay_rebroadcast_seen.items()
+                        if float(ts) >= cutoff
+                    }
+
+                last = self._lh_relay_rebroadcast_seen.get(rb_key)
+                if last is not None and (now - float(last)) < float(self._lh_relay_rebroadcast_min_s):
+                    return
+                self._lh_relay_rebroadcast_seen[rb_key] = now
+
+            msg = {
+                "v": 1,
+                "t": "presence",
+                "ts": now,
+                "user_id": p.user_id,
+                "name": p.name,
+                "room": p.room,
+                "tcp_port": 0,
+                "ip": "relay",              # IMPORTANT: forces receivers to treat as relay
+                "_relay_via": via_key,       # IMPORTANT: tells receivers which lighthouse to use
+                "avatar_sha": p.avatar_sha,
+                "wallet_addr": p.wallet_addr,
+            }
+            mcast_send(self.group, self.port, self.ttl, msg)
+        except Exception:
+            pass
 
     def _relay_download_register(self, req_id: str, save_path: str, expected_size: int, expected_sha256: str) -> None:
         Path(save_path).resolve().parent.mkdir(parents=True, exist_ok=True)
@@ -1453,6 +1766,35 @@ class P2PService:
                 for p in peers:
                     if isinstance(p, dict):
                         self._relay_peer_upsert(p, via_key)
+
+            # --- NEW: auto-learn + optionally auto-connect discovered lighthouses ---
+            lhl = msg.get("lighthouses") or []
+            if isinstance(lhl, list) and lhl:
+                discovered: List[str] = []
+                for it in lhl:
+                    if not isinstance(it, dict):
+                        continue
+                    ip = _safe_str(it.get("ip") or "", 128).strip()
+                    port = _clamp_int(it.get("port") or 0, 0, 65535, 0)
+                    if ip and port > 0:
+                        discovered.append(f"{ip}:{port}")
+
+                discovered = self._normalize_lh_addrs(discovered)
+                if discovered:
+                    with self._known_lighthouses_lock:
+                        for a in discovered:
+                            self.known_lighthouses.add(a)
+
+                        # cap
+                        keep = list(self.known_lighthouses)[:MAX_AUTO_LIGHTHOUSES]
+                        self.known_lighthouses = set(keep)
+
+                    if AUTO_CONNECT_DISCOVERED_LIGHTHOUSES:
+                        # connect union of current targets + discovered
+                        union = sorted(set(self._lh_targets + list(self.known_lighthouses)))
+                        union = union[:MAX_AUTO_LIGHTHOUSES]
+                        self.connect_lighthouses(union, token=self._lh_token)
+
             return
 
         # ---- Room broadcast path (cross-router room traffic) ----
@@ -1460,9 +1802,22 @@ class P2PService:
             payload = msg.get("msg")
             if not isinstance(payload, dict):
                 return
+
             inner = dict(payload)
             inner["_relay_via"] = via_key
+
+            # Process locally (queues/UI)
             self._handle_udp(inner, "relay")
+
+            # --- NEW: Bridge lighthouse -> LAN (so LAN-only peers see it) ---
+            if not DISABLE_MCAST:
+                mid = _safe_str(inner.get("msg_id") or "", 128).strip()
+                if mid:
+                    if self._bridge_mark_once(f"lh2lan|{mid}"):
+                        try:
+                            mcast_send(self.group, self.port, self.ttl, inner)
+                        except Exception:
+                            pass
             return
 
         if t == "relay":
@@ -1471,17 +1826,37 @@ class P2PService:
             if not isinstance(payload, dict):
                 return
 
+            # ✅ Preserve which lighthouse delivered it
             payload["_relay_via"] = via_key
+
+            # ✅ CRITICAL: some lighthouse servers keep the destination only in the OUTER wrapper
+            # (msg["to"]), not inside payload["to_user_id"]. Your _handle_dm() drops if to_user_id
+            # exists and doesn't match. So ensure it's present and correct.
+            to_uid_outer = _safe_str(msg.get("to") or msg.get("to_user_id") or "", 128)
+            if to_uid_outer and not str(payload.get("to_user_id") or "").strip():
+                payload["to_user_id"] = to_uid_outer
+
+            # Optional: keep to_name if missing (nice UI)
+            if "to_name" not in payload or not str(payload.get("to_name") or "").strip():
+                payload["to_name"] = ""
 
             if kind == "dm":
                 self._handle_dm(payload, ("relay", 0))
                 return
+
             if kind == "dm_file_offer":
+                # same idea: carry destination + relay marker
+                if to_uid_outer and not str(payload.get("to_user_id") or "").strip():
+                    payload["to_user_id"] = to_uid_outer
                 self._handle_dm_file_offer_tcp(payload, ("relay", 0))
                 return
+
             if kind == "tx_push":
+                if to_uid_outer and not str(payload.get("to_user_id") or "").strip():
+                    payload["to_user_id"] = to_uid_outer
                 self._handle_tx_push_tcp(payload, ("relay", 0))
                 return
+
             return
 
         # ---- relay file receive path ----
@@ -1785,3 +2160,74 @@ class P2PService:
                 cli.send(obj)
                 return True
         return False
+
+    def _pick_lan_bridge(self) -> Optional[PeerInfo]:
+        """
+        Choose a LAN peer that can relay via lighthouse (lh_bridge==True).
+        This lets LAN-only nodes message relay peers without their own lighthouse connection.
+        """
+        try:
+            best: Optional[PeerInfo] = None
+            best_ts = 0.0
+            for p in self.peers.list():
+                if not p:
+                    continue
+                if p.user_id == self.identity.user_id:
+                    continue
+                if p.ip == "relay":
+                    continue
+                if int(p.tcp_port or 0) <= 0:
+                    continue
+                if not bool(getattr(p, "lh_bridge", False)):
+                    continue
+                ts = float(getattr(p, "last_seen", 0.0) or 0.0)
+                if ts >= best_ts:
+                    best_ts = ts
+                    best = p
+            return best
+        except Exception:
+            return None
+
+    def _handle_bridge_relay_tcp(self, msg: Dict[str, Any], addr: Tuple[str, int]) -> None:
+        """
+        We are a LAN bridge node. A LAN-only peer asked us to relay something via lighthouse.
+        """
+        try:
+            kind = _safe_str(msg.get("kind") or "", 32)
+            to_uid = _safe_str(msg.get("to") or "", 128)
+            payload = msg.get("msg")
+
+            if kind not in ("dm", "tx_push", "dm_file_offer"):
+                return
+            if not to_uid or not isinstance(payload, dict):
+                return
+
+            # must have an active lighthouse connection to act as bridge
+            if not self._lhs or not any(cli.is_connected for cli in self._lhs.values()):
+                return
+
+            # size safety
+            try:
+                if len(json.dumps(payload, ensure_ascii=False)) > MAX_BRIDGE_RELAY_BYTES:
+                    return
+            except Exception:
+                return
+
+            # Forward via lighthouse relay
+            cli = None
+            dst_peer = self.peers.get(to_uid)
+            if dst_peer:
+                cli = self._lh_best_for_peer(dst_peer)
+
+            if cli is None:
+                for c in self._lhs.values():
+                    if c.is_connected:
+                        cli = c
+                        break
+
+            if not cli:
+                return
+
+            cli.send({"t": "relay", "kind": kind, "to": to_uid, "msg": payload})
+        except Exception:
+            pass
