@@ -1,6 +1,6 @@
 # P2P Community App (Block-based)
 <img width="1112" height="950" alt="Screenshot 2026-02-16 220227" src="https://github.com/user-attachments/assets/9cfe4389-67e8-4a2f-949b-3c81462dfb64" />
-
+RUNNING SERVER!!! on IP: 170.253.163.90:38888
 # P2P Community App (Block-based)
 
 A small **LAN-first** community app that works **without a central server**, with an optional “Lighthouse” relay layer for harder networks (different routers / NAT).
